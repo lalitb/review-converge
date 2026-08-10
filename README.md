@@ -82,7 +82,7 @@ Tracked staged and unstaged changes can be included in the pinned snapshot:
 review-converge --local --base main --include-dirty
 ```
 
-Untracked files are rejected rather than silently omitted. Add them to Git or remove them before using `--include-dirty`. The run stops if the selected head or captured worktree changes.
+`--include-dirty` requires the selected `--head` to resolve to the currently checked-out `HEAD`, because staged and unstaged changes belong to that worktree. Untracked files are rejected rather than silently omitted; add, ignore, or remove them first. The run stops if the selected head or captured worktree changes.
 
 ## Dry run
 

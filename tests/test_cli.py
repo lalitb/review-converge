@@ -15,9 +15,12 @@ from review_converge.cli import (
     collect_review_threads,
     converged,
     extract_claude_result,
+    graphql,
+    main,
     parse_repo,
     render_prompt,
     validate_args,
+    validate_review,
 )
 
 
@@ -52,14 +55,29 @@ def reconciliation(**changes):
 class ConvergenceTest(unittest.TestCase):
     def test_requires_matching_verdict_and_decisions(self):
         clean = reconciliation()
-        self.assertTrue(converged(clean, clean))
-        self.assertFalse(converged(clean, reconciliation(revised_verdict="comment")))
-        self.assertFalse(converged(clean, reconciliation(responses=[])))
-        self.assertFalse(converged(clean, reconciliation(new_findings=[{"id": "codex:F2"}])))
+        expected = {"claude:F1"}
+        self.assertTrue(converged(clean, clean, expected))
+        self.assertFalse(converged(clean, reconciliation(revised_verdict="comment"), expected))
+        self.assertFalse(converged(clean, reconciliation(responses=[]), expected))
+        self.assertFalse(
+            converged(clean, reconciliation(new_findings=[{"id": "codex:F2"}]), expected)
+        )
+
+    def test_matching_omissions_do_not_converge(self):
+        omitted = reconciliation(responses=[])
+        self.assertFalse(converged(omitted, omitted, {"claude:F1"}))
 
     def test_rejects_duplicate_finding_ids(self):
         duplicate = reconciliation(responses=reconciliation()["responses"] * 2)
-        self.assertFalse(converged(duplicate, duplicate))
+        self.assertFalse(converged(duplicate, duplicate, {"claude:F1"}))
+
+    def test_review_identity_and_finding_namespace_are_validated(self):
+        review = {"reviewer": "claude", "findings": [{"id": "claude:F1"}]}
+        self.assertEqual(validate_review(review, "claude"), {"claude:F1"})
+        with self.assertRaisesRegex(ConvergeError, "review identity"):
+            validate_review(review, "codex")
+        with self.assertRaisesRegex(ConvergeError, "must start"):
+            validate_review({"reviewer": "claude", "findings": [{"id": "F1"}]}, "claude")
 
 
 class HelpersTest(unittest.TestCase):
@@ -124,6 +142,18 @@ class LocalSnapshotTest(unittest.TestCase):
                 "reviewThreads": [], "reviews": []
             })
 
+    def test_local_dry_run_exercises_cli_without_github(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = self.make_repo(root)
+            with mock.patch("review_converge.cli.gh_json", side_effect=AssertionError("GitHub called")):
+                result = main([
+                    "--local", "--base", "base", "--repo-dir", str(repo),
+                    "--output-dir", str(root / "out"), "--dry-run",
+                ])
+            self.assertEqual(result, 0)
+            self.assertTrue((root / "out" / "snapshot.json").is_file())
+
     def test_dirty_changes_require_opt_in(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -140,11 +170,32 @@ class LocalSnapshotTest(unittest.TestCase):
             root = Path(temp)
             repo = self.make_repo(root)
             (repo / "new.txt").write_text("new\n", encoding="utf-8")
-            with self.assertRaisesRegex(ConvergeError, "does not include untracked"):
+            with self.assertRaisesRegex(ConvergeError, "untracked files"):
                 collect_local_snapshot(repo, "base", "HEAD", root / "out", 10, True)
+
+    def test_dirty_changes_require_selected_head_to_be_checked_out(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = self.make_repo(root)
+            self.git(repo, "branch", "feature")
+            self.git(repo, "checkout", "-q", "base")
+            with self.assertRaisesRegex(ConvergeError, "checked-out HEAD"):
+                collect_local_snapshot(repo, "base", "feature", root / "out", 10, True)
 
 
 class PaginationTest(unittest.TestCase):
+    def test_graphql_errors_become_converge_errors(self):
+        with mock.patch("review_converge.cli.gh_json", return_value={
+            "data": None, "errors": [{"message": "Something failed"}]
+        }):
+            with self.assertRaisesRegex(ConvergeError, "Something failed"):
+                graphql(Path("."), "query { viewer { login } }", {}, 10)
+
+    def test_graphql_requires_data(self):
+        with mock.patch("review_converge.cli.gh_json", return_value={}):
+            with self.assertRaisesRegex(ConvergeError, "did not contain data"):
+                graphql(Path("."), "query { viewer { login } }", {}, 10)
+
     def test_paginates_threads_nested_comments_and_reviews(self):
         def fake_graphql(_repo_dir, query, variables, _timeout):
             after = variables.get("after")
@@ -207,6 +258,7 @@ class GitHubSnapshotTest(unittest.TestCase):
             )
         self.assertEqual(snapshot.base_tip_sha, "new-base-tip")
         self.assertEqual(snapshot.merge_base_sha, "old-merge-base")
+        self.assertEqual(snapshot.pr, 7)
 
 
 class SchemaTest(unittest.TestCase):

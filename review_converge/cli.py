@@ -34,6 +34,7 @@ class Snapshot:
     source: str
     repo: str
     target: str
+    pr: int | None
     head_sha: str
     merge_base_sha: str
     base_tip_sha: str
@@ -128,7 +129,19 @@ def graphql(
             continue
         flag = "-F" if isinstance(value, int) else "-f"
         args.extend([flag, f"{key}={value}"])
-    return gh_json(repo_dir, args, timeout)
+    result = gh_json(repo_dir, args, timeout)
+    if not isinstance(result, dict):
+        raise ConvergeError("GitHub GraphQL returned a non-object response")
+    errors = result.get("errors")
+    if errors:
+        messages = [
+            str(error.get("message", error)) if isinstance(error, dict) else str(error)
+            for error in errors
+        ]
+        raise ConvergeError(f"GitHub GraphQL error: {'; '.join(messages)}")
+    if result.get("data") is None:
+        raise ConvergeError("GitHub GraphQL response did not contain data")
+    return result
 
 
 def collect_review_threads(
@@ -290,13 +303,9 @@ def collect_github_snapshot(
     }
     write_json(output_dir / "snapshot.json", snapshot_data)
     return Snapshot(
-        "github", repo, f"PR #{pr}", head_sha, merge_base_sha, base_tip_sha,
+        "github", repo, f"PR #{pr}", pr, head_sha, merge_base_sha, base_tip_sha,
         base_ref, head_ref, output_dir
     )
-
-
-# Backward-compatible public name for callers of the 0.1 API.
-collect_snapshot = collect_github_snapshot
 
 
 def local_diff(repo_dir: Path, merge_base: str, head_sha: str, include_dirty: bool, timeout: int) -> str:
@@ -333,10 +342,16 @@ def collect_local_snapshot(
     status = run(
         ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=repo_dir, timeout=timeout
     ).stdout
-    if include_dirty and any(line.startswith("?? ") for line in status.splitlines()):
-        raise ConvergeError("--include-dirty does not include untracked files; add or remove them first")
+    if any(line.startswith("?? ") for line in status.splitlines()):
+        raise ConvergeError(
+            "Local worktree contains untracked files, which --include-dirty cannot capture; "
+            "add, ignore, or remove them first"
+        )
     if status and not include_dirty:
         raise ConvergeError("Local worktree is dirty; commit/stash changes or use --include-dirty")
+    checked_out_head_sha = git_output(repo_dir, ["rev-parse", "--verify", "HEAD^{commit}"], timeout)
+    if include_dirty and head_sha != checked_out_head_sha:
+        raise ConvergeError("--include-dirty requires --head to resolve to the checked-out HEAD")
     fingerprint = worktree_fingerprint(repo_dir, head_sha, timeout) if include_dirty else None
     create_output_dir(output_dir)
     diff = local_diff(repo_dir, merge_base_sha, head_sha, include_dirty, timeout)
@@ -366,7 +381,7 @@ def collect_local_snapshot(
     }
     write_json(output_dir / "snapshot.json", snapshot_data)
     return Snapshot(
-        "local", repo, snapshot_data["target"], head_sha, merge_base_sha, base_tip_sha,
+        "local", repo, snapshot_data["target"], None, head_sha, merge_base_sha, base_tip_sha,
         base_ref, head_ref, output_dir, fingerprint
     )
 
@@ -414,7 +429,6 @@ def extract_claude_result(stdout: str) -> Any:
 
 class ReviewerAdapter(Protocol):
     name: str
-    capabilities: frozenset[str]
 
     def invoke(self, prompt: str, schema_path: Path) -> Any: ...
 
@@ -426,7 +440,6 @@ class ClaudeAdapter:
     model: str | None = None
     max_budget: float | None = None
     name: str = "claude"
-    capabilities: frozenset[str] = frozenset({"read-only", "model-override", "usd-budget"})
 
     def invoke(self, prompt: str, schema_path: Path) -> Any:
         schema = schema_path.read_text(encoding="utf-8")
@@ -452,7 +465,6 @@ class CodexAdapter:
     timeout: int
     model: str | None = None
     name: str = "codex"
-    capabilities: frozenset[str] = frozenset({"read-only", "model-override"})
 
     def invoke(self, prompt: str, schema_path: Path) -> Any:
         with tempfile.NamedTemporaryFile(
@@ -472,19 +484,6 @@ class CodexAdapter:
             return load_json(output_path)
         finally:
             output_path.unlink(missing_ok=True)
-
-
-def run_claude(
-    prompt: str, schema_path: Path, repo_dir: Path, timeout: int,
-    model: str | None, max_budget: float | None,
-) -> Any:
-    return ClaudeAdapter(repo_dir, timeout, model, max_budget).invoke(prompt, schema_path)
-
-
-def run_codex(
-    prompt: str, schema_path: Path, repo_dir: Path, timeout: int, model: str | None,
-) -> Any:
-    return CodexAdapter(repo_dir, timeout, model).invoke(prompt, schema_path)
 
 
 def run_pair(claude_call: Any, codex_call: Any) -> tuple[Any, Any]:
@@ -507,13 +506,55 @@ def response_decisions(result: dict[str, Any]) -> dict[str, tuple[Any, Any]] | N
     return decisions
 
 
-def converged(claude: dict[str, Any], codex: dict[str, Any]) -> bool:
+def finding_ids(result: dict[str, Any], field: str) -> set[str]:
+    findings = result.get(field)
+    if not isinstance(findings, list):
+        raise ConvergeError(f"Reviewer output did not contain a {field} array")
+    ids: set[str] = set()
+    for finding in findings:
+        finding_id = finding.get("id") if isinstance(finding, dict) else None
+        if not isinstance(finding_id, str) or not finding_id:
+            raise ConvergeError(f"Reviewer output contained an invalid {field} ID")
+        if finding_id in ids:
+            raise ConvergeError(f"Reviewer output repeated finding ID {finding_id}")
+        ids.add(finding_id)
+    return ids
+
+
+def validate_review(result: dict[str, Any], reviewer: str) -> set[str]:
+    if result.get("reviewer") != reviewer:
+        raise ConvergeError(f"Expected {reviewer} review identity, got {result.get('reviewer')!r}")
+    ids = finding_ids(result, "findings")
+    prefix = f"{reviewer}:"
+    invalid = sorted(finding_id for finding_id in ids if not finding_id.startswith(prefix))
+    if invalid:
+        raise ConvergeError(f"{reviewer} finding IDs must start with {prefix}: {', '.join(invalid)}")
+    return ids
+
+
+def validate_new_findings(result: dict[str, Any], reviewer: str) -> set[str]:
+    if result.get("reviewer") != reviewer:
+        raise ConvergeError(f"Expected {reviewer} reconciliation identity, got {result.get('reviewer')!r}")
+    ids = finding_ids(result, "new_findings")
+    prefix = f"{reviewer}:"
+    invalid = sorted(finding_id for finding_id in ids if not finding_id.startswith(prefix))
+    if invalid:
+        raise ConvergeError(f"{reviewer} finding IDs must start with {prefix}: {', '.join(invalid)}")
+    return ids
+
+
+def converged(
+    claude: dict[str, Any], codex: dict[str, Any], expected_finding_ids: set[str]
+) -> bool:
     claude_decisions = response_decisions(claude)
     codex_decisions = response_decisions(codex)
     return bool(
         claude.get("converged") and codex.get("converged")
         and claude.get("revised_verdict") == codex.get("revised_verdict")
-        and claude_decisions is not None and claude_decisions == codex_decisions
+        and claude_decisions is not None and codex_decisions is not None
+        and set(claude_decisions) == expected_finding_ids
+        and set(codex_decisions) == expected_finding_ids
+        and claude_decisions == codex_decisions
         and not claude.get("material_disagreements")
         and not codex.get("material_disagreements")
         and not claude.get("new_findings") and not codex.get("new_findings")
@@ -526,9 +567,12 @@ def artifact_path(output_dir: Path, round_number: int, reviewer: str) -> Path:
 
 def snapshot_unchanged(snapshot: Snapshot, repo_dir: Path, timeout: int) -> bool:
     if snapshot.source == "github":
-        pr = int(snapshot.target.removeprefix("PR #"))
+        if snapshot.pr is None:
+            raise ConvergeError("GitHub snapshot is missing its pull-request number")
         data = gh_json(
-            repo_dir, ["pr", "view", str(pr), "--repo", snapshot.repo, "--json", "headRefOid"], timeout
+            repo_dir,
+            ["pr", "view", str(snapshot.pr), "--repo", snapshot.repo, "--json", "headRefOid"],
+            timeout,
         )
         return str(data["headRefOid"]) == snapshot.head_sha
     if git_output(repo_dir, ["rev-parse", "--verify", f"{snapshot.head_ref}^{{commit}}"], timeout) != snapshot.head_sha:
@@ -631,7 +675,12 @@ def execute(args: argparse.Namespace) -> Path:
     )
     write_json(artifact_path(output_dir, 0, "claude"), claude_review)
     write_json(artifact_path(output_dir, 0, "codex"), codex_review)
-
+    expected_finding_ids = validate_review(claude_review, "claude")
+    codex_finding_ids = validate_review(codex_review, "codex")
+    collision = expected_finding_ids & codex_finding_ids
+    if collision:
+        raise ConvergeError(f"Initial reviews reused finding IDs: {', '.join(sorted(collision))}")
+    expected_finding_ids |= codex_finding_ids
     claude_latest: dict[str, Any] = claude_review
     codex_latest: dict[str, Any] = codex_review
     rounds_run = 0
@@ -644,6 +693,8 @@ def execute(args: argparse.Namespace) -> Path:
             "round": str(round_number),
             "claude_latest": str(artifact_path(output_dir, round_number - 1, "claude")),
             "codex_latest": str(artifact_path(output_dir, round_number - 1, "codex")),
+            "artifact_glob": str(output_dir / "round-*.json"),
+            "expected_finding_ids": json.dumps(sorted(expected_finding_ids)),
         }
         prompt = render_prompt("reconcile.md", values)
         claude_latest, codex_latest = run_pair(
@@ -652,10 +703,18 @@ def execute(args: argparse.Namespace) -> Path:
         )
         write_json(artifact_path(output_dir, round_number, "claude"), claude_latest)
         write_json(artifact_path(output_dir, round_number, "codex"), codex_latest)
+        claude_new_ids = validate_new_findings(claude_latest, "claude")
+        codex_new_ids = validate_new_findings(codex_latest, "codex")
+        repeated = expected_finding_ids & (claude_new_ids | codex_new_ids)
+        if repeated:
+            raise ConvergeError(
+                f"Reconciliation reused existing finding IDs: {', '.join(sorted(repeated))}"
+            )
         rounds_run = round_number
-        if converged(claude_latest, codex_latest):
+        if converged(claude_latest, codex_latest, expected_finding_ids):
             print(f"Converged after round {round_number}.")
             break
+        expected_finding_ids |= claude_new_ids | codex_new_ids
 
     if not snapshot_unchanged(snapshot, repo_dir, args.timeout):
         raise ConvergeError("Review source changed before final decision; rerun")
