@@ -1,0 +1,28 @@
+[project]
+name = "review-converge"
+version = "0.2.0"
+description = "Evidence-based multi-agent AI code review convergence"
+requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+keywords = ["ai-code-review", "multi-agent", "pull-request", "codex", "claude", "llm"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.scripts]
+review-converge = "review_converge.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["review_converge"]
+
+[tool.setuptools.data-files]
+"share/review-converge/schemas" = ["schemas/*.json"]
+"share/review-converge/prompts" = ["prompts/*.md"]

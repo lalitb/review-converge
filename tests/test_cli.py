@@ -1,0 +1,221 @@
+import argparse
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from review_converge.cli import (
+    ConvergeError,
+    SCHEMAS,
+    artifact_path,
+    collect_local_snapshot,
+    collect_github_snapshot,
+    collect_review_threads,
+    converged,
+    extract_claude_result,
+    parse_repo,
+    render_prompt,
+    validate_args,
+)
+
+
+class ExtractClaudeResultTest(unittest.TestCase):
+    def test_structured_output_object(self):
+        value = {"verdict": "approve"}
+        self.assertEqual(extract_claude_result(json.dumps({"structured_output": value})), value)
+
+    def test_result_json_string(self):
+        value = {"verdict": "comment"}
+        self.assertEqual(extract_claude_result(json.dumps({"result": json.dumps(value)})), value)
+
+    def test_rejects_non_json_result(self):
+        with self.assertRaises(ConvergeError):
+            extract_claude_result(json.dumps({"result": "not json"}))
+
+
+def reconciliation(**changes):
+    value = {
+        "converged": True,
+        "revised_verdict": "approve",
+        "responses": [
+            {"finding_id": "claude:F1", "decision": "reject", "corrected_severity": None}
+        ],
+        "material_disagreements": [],
+        "new_findings": [],
+    }
+    value.update(changes)
+    return value
+
+
+class ConvergenceTest(unittest.TestCase):
+    def test_requires_matching_verdict_and_decisions(self):
+        clean = reconciliation()
+        self.assertTrue(converged(clean, clean))
+        self.assertFalse(converged(clean, reconciliation(revised_verdict="comment")))
+        self.assertFalse(converged(clean, reconciliation(responses=[])))
+        self.assertFalse(converged(clean, reconciliation(new_findings=[{"id": "codex:F2"}])))
+
+    def test_rejects_duplicate_finding_ids(self):
+        duplicate = reconciliation(responses=reconciliation()["responses"] * 2)
+        self.assertFalse(converged(duplicate, duplicate))
+
+
+class HelpersTest(unittest.TestCase):
+    def test_artifact_paths_have_no_round_zero_special_case(self):
+        root = Path("/tmp/output")
+        self.assertEqual(artifact_path(root, 0, "claude"), root / "round-0-claude.json")
+        self.assertEqual(artifact_path(root, 3, "codex"), root / "round-3-codex.json")
+
+    def test_repo_requires_owner_and_name(self):
+        self.assertEqual(parse_repo("owner/name"), ("owner", "name"))
+        for invalid in ("name", "/name", "owner/", "a/b/c"):
+            with self.subTest(invalid=invalid), self.assertRaises(ConvergeError):
+                parse_repo(invalid)
+
+    def test_render_prompt_rejects_missing_values(self):
+        with self.assertRaises(ConvergeError):
+            render_prompt("review.md", {})
+
+    def test_local_argument_validation(self):
+        base = dict(
+            rounds=3, local=True, base=None, head="HEAD", include_dirty=False,
+            repo=None, no_fetch=False,
+        )
+        with self.assertRaisesRegex(ConvergeError, "requires --base"):
+            validate_args(argparse.Namespace(**base))
+        validate_args(argparse.Namespace(**{**base, "base": "main"}))
+
+
+class LocalSnapshotTest(unittest.TestCase):
+    def git(self, repo: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        ).stdout.strip()
+
+    def make_repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        repo.mkdir()
+        self.git(repo, "init", "-q")
+        self.git(repo, "config", "user.name", "Test")
+        self.git(repo, "config", "user.email", "test@example.com")
+        (repo / "file.txt").write_text("base\n", encoding="utf-8")
+        self.git(repo, "add", "file.txt")
+        self.git(repo, "commit", "-qm", "base")
+        self.git(repo, "branch", "base")
+        (repo / "file.txt").write_text("head\n", encoding="utf-8")
+        self.git(repo, "commit", "-qam", "head")
+        return repo
+
+    def test_collects_pinned_snapshot_without_github(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = self.make_repo(root)
+            with mock.patch("review_converge.cli.gh_json", side_effect=AssertionError("GitHub called")):
+                snapshot = collect_local_snapshot(
+                    repo, "base", "HEAD", root / "out", 10, include_dirty=False
+                )
+            self.assertEqual(snapshot.source, "local")
+            self.assertNotEqual(snapshot.merge_base_sha, snapshot.head_sha)
+            self.assertIn("-base", (root / "out" / "diff.patch").read_text(encoding="utf-8"))
+            self.assertEqual(json.loads((root / "out" / "threads.json").read_text()), {
+                "reviewThreads": [], "reviews": []
+            })
+
+    def test_dirty_changes_require_opt_in(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = self.make_repo(root)
+            (repo / "file.txt").write_text("dirty\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConvergeError, "worktree is dirty"):
+                collect_local_snapshot(repo, "base", "HEAD", root / "out", 10, False)
+            snapshot = collect_local_snapshot(repo, "base", "HEAD", root / "dirty-out", 10, True)
+            self.assertIsNotNone(snapshot.worktree_fingerprint)
+            self.assertIn("Uncommitted tracked changes", (root / "dirty-out" / "diff.patch").read_text())
+
+    def test_untracked_files_are_not_silently_omitted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = self.make_repo(root)
+            (repo / "new.txt").write_text("new\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConvergeError, "does not include untracked"):
+                collect_local_snapshot(repo, "base", "HEAD", root / "out", 10, True)
+
+
+class PaginationTest(unittest.TestCase):
+    def test_paginates_threads_nested_comments_and_reviews(self):
+        def fake_graphql(_repo_dir, query, variables, _timeout):
+            after = variables.get("after")
+            if "reviewThreads" in query:
+                node = {
+                    "id": "T1" if after is None else "T2",
+                    "isResolved": False, "isOutdated": False, "path": "a.py",
+                    "line": 1, "originalLine": 1,
+                    "comments": {
+                        "nodes": [{"body": "first"}],
+                        "pageInfo": {"hasNextPage": after is None, "endCursor": "C1"},
+                    },
+                }
+                return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                    "nodes": [node],
+                    "pageInfo": {"hasNextPage": after is None, "endCursor": "T-CURSOR"},
+                }}}}}
+            if "node(id:$id)" in query:
+                return {"data": {"node": {"comments": {
+                    "nodes": [{"body": "second"}],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }}}}
+            return {"data": {"repository": {"pullRequest": {"reviews": {
+                "nodes": [{"state": "COMMENTED" if after is None else "APPROVED"}],
+                "pageInfo": {"hasNextPage": after is None, "endCursor": "R-CURSOR"},
+            }}}}}
+
+        with mock.patch("review_converge.cli.graphql", side_effect=fake_graphql):
+            result = collect_review_threads(Path("."), "owner/repo", 1, 10)
+        self.assertEqual(len(result["reviewThreads"]), 2)
+        self.assertEqual(len(result["reviewThreads"][0]["comments"]["nodes"]), 2)
+        self.assertEqual(len(result["reviews"]), 2)
+
+
+class GitHubSnapshotTest(unittest.TestCase):
+    def test_keeps_base_tip_and_merge_base_separate_without_fetch(self):
+        metadata = {
+            "number": 7, "headRefOid": "head", "baseRefOid": "new-base-tip",
+            "baseRefName": "main", "headRefName": "feature",
+        }
+
+        def fake_gh(_repo_dir, args, _timeout):
+            if args[:2] == ["pr", "view"]:
+                return metadata
+            if args[:2] == ["api", "repos/owner/repo/compare/new-base-tip...head"]:
+                return {"merge_base_commit": {"sha": "old-merge-base"}}
+            if "--slurp" in args:
+                return [[]]
+            raise AssertionError(args)
+
+        completed = subprocess.CompletedProcess([], 0, stdout="diff\n", stderr="")
+        with tempfile.TemporaryDirectory() as temp, \
+             mock.patch("review_converge.cli.gh_json", side_effect=fake_gh), \
+             mock.patch("review_converge.cli.collect_review_threads", return_value={
+                 "reviewThreads": [], "reviews": []
+             }), \
+             mock.patch("review_converge.cli.run", return_value=completed):
+            snapshot = collect_github_snapshot(
+                Path("."), "owner/repo", 7, Path(temp) / "out", 10, fetch_refs=False
+            )
+        self.assertEqual(snapshot.base_tip_sha, "new-base-tip")
+        self.assertEqual(snapshot.merge_base_sha, "old-merge-base")
+
+
+class SchemaTest(unittest.TestCase):
+    def test_all_schemas_are_closed_json_objects(self):
+        for name in ("review.json", "reconciliation.json", "final.json"):
+            value = json.loads((SCHEMAS / name).read_text(encoding="utf-8"))
+            self.assertEqual(value["type"], "object")
+            self.assertFalse(value["additionalProperties"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "head_sha": {"type": "string"},
+    "verdict": {"enum": ["approve", "comment", "request_changes"]},
+    "converged": {"type": "boolean"},
+    "remaining_disagreements": {"type": "array", "items": {"type": "string"}},
+    "final_markdown": {"type": "string"}
+  },
+  "required": ["head_sha", "verdict", "converged", "remaining_disagreements", "final_markdown"]
+}

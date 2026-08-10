@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "reviewer": {"enum": ["claude", "codex"]},
+    "responses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "finding_id": {"type": "string"},
+          "decision": {"enum": ["accept", "reject", "downgrade", "already_covered"]},
+          "reason": {"type": "string"},
+          "corrected_severity": {"type": ["string", "null"], "enum": ["blocker", "high", "medium", "low", null]},
+          "corrected_comment": {"type": ["string", "null"]}
+        },
+        "required": ["finding_id", "decision", "reason", "corrected_severity", "corrected_comment"]
+      }
+    },
+    "new_findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "material_disagreements": {"type": "array", "items": {"type": "string"}},
+    "revised_verdict": {"enum": ["approve", "comment", "request_changes"]},
+    "converged": {"type": "boolean"},
+    "summary": {"type": "string"}
+  },
+  "required": ["reviewer", "responses", "new_findings", "material_disagreements", "revised_verdict", "converged", "summary"],
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string"},
+        "severity": {"enum": ["blocker", "high", "medium", "low"]},
+        "file": {"type": "string"},
+        "line": {"type": ["integer", "null"]},
+        "snippet": {"type": "string"},
+        "claim": {"type": "string"},
+        "evidence": {"type": "string"},
+        "impact": {"type": "string"},
+        "comment": {"type": "string"},
+        "thread_status": {"enum": ["new", "already_covered", "resolved", "outdated"]}
+      },
+      "required": ["id", "severity", "file", "line", "snippet", "claim", "evidence", "impact", "comment", "thread_status"]
+    }
+  }
+}

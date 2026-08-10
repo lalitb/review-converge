@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "reviewer": {"enum": ["claude", "codex"]},
+    "verdict": {"enum": ["approve", "comment", "request_changes"]},
+    "summary": {"type": "string"},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "severity": {"enum": ["blocker", "high", "medium", "low"]},
+          "file": {"type": "string"},
+          "line": {"type": ["integer", "null"]},
+          "snippet": {"type": "string"},
+          "claim": {"type": "string"},
+          "evidence": {"type": "string"},
+          "impact": {"type": "string"},
+          "comment": {"type": "string"},
+          "thread_status": {"enum": ["new", "already_covered", "resolved", "outdated"]}
+        },
+        "required": ["id", "severity", "file", "line", "snippet", "claim", "evidence", "impact", "comment", "thread_status"]
+      }
+    },
+    "scope_notes": {"type": "array", "items": {"type": "string"}},
+    "rejected_candidates": {"type": "array", "items": {"type": "string"}},
+    "confidence": {"enum": ["high", "medium", "low"]}
+  },
+  "required": ["reviewer", "verdict", "summary", "findings", "scope_notes", "rejected_candidates", "confidence"]
+}
