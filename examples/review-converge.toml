@@ -1,0 +1,12 @@
+# Configuration is loaded only when passed with --config.
+reviewers = ["claude:sonnet", "codex"]
+final_decider = "codex"
+rounds = 3
+timeout = 1800
+context_files = ["CONTRIBUTING.md"]
+fail_on = "request_changes"
+
+# Optional per-invocation provider limits:
+# claude_max_budget_usd = 2.00
+# copilot_max_ai_credits = 30
+# structured_retries = 1

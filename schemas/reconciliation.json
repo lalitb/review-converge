@@ -16,14 +16,7 @@
           "corrected_severity": {"type": ["string", "null"], "enum": ["blocker", "high", "medium", "low", null]},
           "corrected_comment": {"type": ["string", "null"]}
         },
-        "required": ["finding_id", "decision", "reason", "corrected_severity", "corrected_comment"],
-        "allOf": [
-          {
-            "if": {"properties": {"decision": {"const": "downgrade"}}},
-            "then": {"properties": {"corrected_severity": {"enum": ["blocker", "high", "medium", "low"]}}},
-            "else": {"properties": {"corrected_severity": {"type": "null"}}}
-          }
-        ]
+        "required": ["finding_id", "decision", "reason", "corrected_severity", "corrected_comment"]
       }
     },
     "new_findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},

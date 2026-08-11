@@ -20,8 +20,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install --editable .
+      - run: python -m pip install --editable '.[copilot]'
       - run: python -m unittest discover -s tests -v
       - run: review-converge --version
       - run: review-converge --help
       - run: review-converge --local --base HEAD^ --dry-run
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install build
+      - run: python -m build
+      - run: python -m pip install jsonschema dist/*.whl
+      - run: review-converge --version
+      - run: review-converge --help
