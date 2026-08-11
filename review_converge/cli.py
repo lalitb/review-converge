@@ -651,7 +651,33 @@ def settings_from_json(value: dict[str, Any]) -> Settings:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="review-converge",
-        description="Converge two independent source-only reviews.",
+        description=(
+            "Run exactly two independent source-only reviews, reconcile their "
+            "findings, and produce an auditable maintainer verdict."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  review-converge --pr 1234
+  review-converge --local --base main
+  review-converge --pr 1234 --instruction "Prioritize API compatibility"
+  review-converge --pr 1234 --instruction-file /path/to/guidance.md
+  review-converge --resume /tmp/review-converge/pr-1234-run
+
+defaults:
+  reviewers:     claude:opus and codex:gpt-5.6-sol
+  final decider: codex:gpt-5.6-sol
+  Codex effort:  low
+  rounds:        3
+
+safety:
+  Reviewers cannot edit the checkout, build, test, post to GitHub, or change refs.
+  Custom instructions may specialize a review but cannot override these constraints.
+
+exit codes:
+  0  review completed and passed any configured gate
+  1  operational, source, or validation failure
+  2  review completed but failed --fail-on
+""",
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--pr", type=int, help="GitHub pull request number")
@@ -667,15 +693,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reviewer", action="append", help="provider[:model]; specify exactly twice"
     )
-    parser.add_argument("--final-decider", help="provider[:model]")
+    parser.add_argument(
+        "--final-decider",
+        help="final provider[:model] (default: codex:gpt-5.6-sol)",
+    )
     parser.add_argument("--repo", help="owner/repo; inferred from the current checkout")
     parser.add_argument(
         "--repo-dir", type=Path, default=Path.cwd(), help="local Git checkout"
     )
     parser.add_argument("--base", help="local mode base ref")
     parser.add_argument("--head", default="HEAD", help="local mode head ref")
-    parser.add_argument("--include-dirty", action="store_true")
-    parser.add_argument("--context-file", action="append")
+    parser.add_argument(
+        "--include-dirty",
+        action="store_true",
+        help="include tracked worktree changes; rejects untracked files",
+    )
+    parser.add_argument(
+        "--context-file",
+        action="append",
+        help="untrusted repository context file; repeat as needed",
+    )
     parser.add_argument(
         "--instruction",
         action="append",
@@ -687,25 +724,45 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="read trusted operator guidance from a file; repeat as needed",
     )
-    parser.add_argument("--rounds", type=int)
-    parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--timeout", type=int)
+    parser.add_argument("--rounds", type=int, help="reconciliation rounds (default: 3)")
+    parser.add_argument(
+        "--output-dir", type=Path, help="new artifact directory outside the checkout"
+    )
+    parser.add_argument("--timeout", type=int, help="seconds allowed per provider call")
     parser.add_argument(
         "--claude-model", help="legacy default-slot Claude model override"
     )
     parser.add_argument(
         "--codex-model", help="legacy default-slot Codex model override"
     )
-    parser.add_argument("--claude-max-budget-usd", type=float)
-    parser.add_argument("--copilot-max-ai-credits", type=float)
+    parser.add_argument(
+        "--claude-max-budget-usd", type=float, help="per-invocation Claude budget cap"
+    )
+    parser.add_argument(
+        "--copilot-max-ai-credits",
+        type=float,
+        help="per-invocation Copilot cap (minimum: 30)",
+    )
     parser.add_argument(
         "--codex-reasoning-effort",
         choices=("minimal", "low", "medium", "high", "xhigh"),
+        help="Codex reasoning effort (default: low)",
     )
-    parser.add_argument("--structured-retries", type=int, choices=[0, 1])
-    parser.add_argument("--fail-on", choices=FAIL_CHOICES)
-    parser.add_argument("--no-fetch", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--structured-retries",
+        type=int,
+        choices=[0, 1],
+        help="Copilot JSON repair attempts (default: 1)",
+    )
+    parser.add_argument(
+        "--fail-on", choices=FAIL_CHOICES, help="return exit 2 when the gate matches"
+    )
+    parser.add_argument(
+        "--no-fetch", action="store_true", help="do not update local review refs"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="capture inputs without invoking models"
+    )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
     )

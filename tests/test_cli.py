@@ -10,6 +10,7 @@ from review_converge.cli import (
     SCHEMAS,
     ConvergeError,
     artifact_path,
+    build_parser,
     collect_github_snapshot,
     collect_local_snapshot,
     collect_review_threads,
@@ -110,6 +111,17 @@ class ConvergenceTest(unittest.TestCase):
 
 
 class HelpersTest(unittest.TestCase):
+    def test_help_documents_defaults_guidance_safety_and_exit_codes(self):
+        help_text = build_parser().format_help()
+        for expected in (
+            "claude:opus and codex:gpt-5.6-sol",
+            "--instruction-file",
+            "cannot override these constraints",
+            "review completed but failed --fail-on",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, help_text)
+
     def test_artifact_paths_have_no_round_zero_special_case(self):
         root = Path("/tmp/output")
         self.assertEqual(artifact_path(root, 0, "r1"), root / "round-0-r1.json")
