@@ -10,7 +10,7 @@ from . import __version__
 from .core import ConvergeError, atomic_write_json, load_json, sha256_bytes, sha256_file
 from .models import InvocationResult, Reviewer
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 
 def utc_now() -> str:

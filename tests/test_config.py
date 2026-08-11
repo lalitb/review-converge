@@ -23,6 +23,15 @@ class ReviewerSpecTest(unittest.TestCase):
 
 
 class ConfigurationTest(unittest.TestCase):
+    def test_defaults_pin_reviewer_and_decider_models(self):
+        settings = Settings()
+        self.assertEqual(
+            [reviewer.display_name for reviewer in settings.reviewers],
+            ["claude:opus", "codex:gpt-5.6-sol"],
+        )
+        self.assertEqual(settings.final_decider.display_name, "codex:gpt-5.6-sol")
+        self.assertEqual(settings.codex_reasoning_effort, "low")
+
     def test_explicit_toml_and_cli_override_precedence(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "review.toml"
@@ -60,4 +69,14 @@ class ConfigurationTest(unittest.TestCase):
                 Settings(), copilot_max_ai_credits=30
             ).copilot_max_ai_credits,
             30,
+        )
+
+    def test_codex_reasoning_effort_is_validated(self):
+        with self.assertRaisesRegex(ConvergeError, "codex_reasoning_effort"):
+            override_settings(Settings(), codex_reasoning_effort="maximum")
+        self.assertEqual(
+            override_settings(
+                Settings(), codex_reasoning_effort="high"
+            ).codex_reasoning_effort,
+            "high",
         )

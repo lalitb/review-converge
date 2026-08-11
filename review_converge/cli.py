@@ -629,6 +629,7 @@ def settings_json(settings: Settings) -> dict[str, Any]:
         "fail_on": settings.fail_on,
         "claude_max_budget_usd": settings.claude_max_budget_usd,
         "copilot_max_ai_credits": settings.copilot_max_ai_credits,
+        "codex_reasoning_effort": settings.codex_reasoning_effort,
         "structured_retries": settings.structured_retries,
     }
 
@@ -644,6 +645,7 @@ def settings_from_json(value: dict[str, Any]) -> Settings:
         fail_on=value.get("fail_on"),
         claude_max_budget_usd=value.get("claude_max_budget_usd"),
         copilot_max_ai_credits=value.get("copilot_max_ai_credits"),
+        codex_reasoning_effort=value.get("codex_reasoning_effort", "low"),
         structured_retries=value.get("structured_retries", 1),
     )
 
@@ -687,6 +689,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--claude-max-budget-usd", type=float)
     parser.add_argument("--copilot-max-ai-credits", type=float)
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        choices=("minimal", "low", "medium", "high", "xhigh"),
+    )
     parser.add_argument("--structured-retries", type=int, choices=[0, 1])
     parser.add_argument("--fail-on", choices=FAIL_CHOICES)
     parser.add_argument("--no-fetch", action="store_true")
@@ -705,6 +711,13 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
             or args.final_decider
             or args.rounds is not None
             or args.context_file
+            or args.timeout is not None
+            or args.claude_model
+            or args.codex_model
+            or args.claude_max_budget_usd is not None
+            or args.copilot_max_ai_credits is not None
+            or args.codex_reasoning_effort is not None
+            or args.structured_retries is not None
         ):
             raise ConvergeError(
                 "--resume does not accept configuration overrides except --fail-on"
@@ -731,6 +744,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         fail_on=args.fail_on,
         claude_max_budget_usd=args.claude_max_budget_usd,
         copilot_max_ai_credits=args.copilot_max_ai_credits,
+        codex_reasoning_effort=args.codex_reasoning_effort,
         structured_retries=args.structured_retries,
     )
 
@@ -898,6 +912,7 @@ def prepare_new_run(
             accessible_dirs=(output_dir,),
             claude_max_budget_usd=settings.claude_max_budget_usd,
             copilot_max_ai_credits=settings.copilot_max_ai_credits,
+            codex_reasoning_effort=settings.codex_reasoning_effort,
             structured_retries=settings.structured_retries,
         )
         for slot, reviewer in unique.items()
@@ -957,6 +972,7 @@ def prepare_resume(
             accessible_dirs=(output_dir,),
             claude_max_budget_usd=settings.claude_max_budget_usd,
             copilot_max_ai_credits=settings.copilot_max_ai_credits,
+            codex_reasoning_effort=settings.codex_reasoning_effort,
             structured_retries=settings.structured_retries,
         )
         for slot, reviewer in unique.items()

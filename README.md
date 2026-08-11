@@ -101,7 +101,7 @@ review-converge --local --base main --dry-run
 
 ## Reviewers and configuration
 
-The default pair remains Claude plus Codex. Configure exactly two slots by repeating `--reviewer`; model selection is explicit when provided:
+The built-in pair is `claude:opus` (currently Opus 5) and `codex:gpt-5.6-sol` with low reasoning effort; the latter is also the default final decider. Override exactly two slots by repeating `--reviewer`, and use `--codex-reasoning-effort` to change Codex effort:
 
 ```sh
 review-converge --local --base main \
@@ -142,7 +142,7 @@ Initial reviews run concurrently. In each reconciliation round, both reviewers a
 - no new findings; and
 - no material disagreements.
 
-After the configured maximum, the final decider resolves what it can from evidence and records anything unresolved. Three rounds is the default; `--rounds 0` skips reconciliation. Codex is the default final decider; any supported `provider[:model]` can be selected.
+After the configured maximum, the final decider resolves what it can from evidence and records anything unresolved. Three rounds is the default; `--rounds 0` skips reconciliation. `codex:gpt-5.6-sol` is the default final decider; any supported `provider[:model]` can be selected.
 
 ## Resume interrupted runs
 

@@ -206,6 +206,7 @@ class CodexAdapter:
     reviewer: Reviewer
     repo_dir: Path
     timeout: int
+    reasoning_effort: str = "low"
 
     def __post_init__(self) -> None:
         self.cli_version = command_version("codex", self.repo_dir, self.timeout)
@@ -234,6 +235,9 @@ class CodexAdapter:
             ]
             if self.reviewer.spec.model:
                 argv.extend(["--model", self.reviewer.spec.model])
+            argv.extend(
+                ["--config", f'model_reasoning_effort="{self.reasoning_effort}"']
+            )
             argv.append(prompt)
             started = time.monotonic()
             result = run(argv, cwd=self.repo_dir, timeout=self.timeout, check=False)
@@ -453,12 +457,13 @@ def make_adapter(
     accessible_dirs: tuple[Path, ...] = (),
     claude_max_budget_usd: float | None = None,
     copilot_max_ai_credits: float | None = None,
+    codex_reasoning_effort: str = "low",
     structured_retries: int = 1,
 ) -> ReviewerAdapter:
     if reviewer.spec.provider == "claude":
         return ClaudeAdapter(reviewer, repo_dir, timeout, claude_max_budget_usd)
     if reviewer.spec.provider == "codex":
-        return CodexAdapter(reviewer, repo_dir, timeout)
+        return CodexAdapter(reviewer, repo_dir, timeout, codex_reasoning_effort)
     return CopilotAdapter(
         reviewer,
         repo_dir,

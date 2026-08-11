@@ -17,16 +17,19 @@ else:  # pragma: no cover - exercised by the Python 3.10 CI job
 @dataclass(frozen=True)
 class Settings:
     reviewers: tuple[ReviewerSpec, ReviewerSpec] = (
-        ReviewerSpec("claude"),
-        ReviewerSpec("codex"),
+        ReviewerSpec("claude", "opus"),
+        ReviewerSpec("codex", "gpt-5.6-sol"),
     )
-    final_decider: ReviewerSpec = field(default_factory=lambda: ReviewerSpec("codex"))
+    final_decider: ReviewerSpec = field(
+        default_factory=lambda: ReviewerSpec("codex", "gpt-5.6-sol")
+    )
     rounds: int = 3
     timeout: int = 1800
     context_files: tuple[str, ...] = ()
     fail_on: str | None = None
     claude_max_budget_usd: float | None = None
     copilot_max_ai_credits: float | None = None
+    codex_reasoning_effort: str = "low"
     structured_retries: int = 1
 
 
@@ -40,6 +43,7 @@ ALLOWED_KEYS = frozenset(
         "fail_on",
         "claude_max_budget_usd",
         "copilot_max_ai_credits",
+        "codex_reasoning_effort",
         "structured_retries",
     }
 )
@@ -56,6 +60,16 @@ def _validate(settings: Settings) -> Settings:
         raise ConvergeError("timeout must be positive")
     if settings.structured_retries not in (0, 1):
         raise ConvergeError("structured_retries must be 0 or 1")
+    if settings.codex_reasoning_effort not in (
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ):
+        raise ConvergeError(
+            "codex_reasoning_effort must be minimal, low, medium, high, or xhigh"
+        )
     if settings.fail_on not in (
         None,
         "request_changes",

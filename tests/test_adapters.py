@@ -8,6 +8,7 @@ from unittest import mock
 from review_converge.adapters import (
     AdapterInvocationError,
     ClaudeAdapter,
+    CodexAdapter,
     CopilotAdapter,
     _copilot_content,
 )
@@ -107,3 +108,33 @@ class FailedUsageTest(unittest.TestCase):
                 adapter.invoke("prompt", schema)
         self.assertEqual(raised.exception.result.usage.cost_usd, 0.25)
         self.assertEqual(raised.exception.result.usage.output_tokens, 20)
+
+
+class CodexAdapterTest(unittest.TestCase):
+    def test_model_and_reasoning_effort_are_explicit(self):
+        event = '{"type":"turn.completed"}\n'
+
+        def fake_run(argv, **_kwargs):
+            output = Path(argv[argv.index("--output-last-message") + 1])
+            output.write_text('{"reviewer":"r2"}', encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, stdout=event, stderr="")
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            mock.patch(
+                "review_converge.adapters.command_version", return_value="codex 1"
+            ),
+            mock.patch("review_converge.adapters.run", side_effect=fake_run) as runner,
+        ):
+            schema = Path(temp) / "schema.json"
+            schema.write_text('{"type":"object"}', encoding="utf-8")
+            adapter = CodexAdapter(
+                Reviewer("r2", ReviewerSpec.parse("codex:gpt-5.6-sol")),
+                Path(temp),
+                10,
+                "low",
+            )
+            adapter.invoke("prompt", schema)
+        argv = runner.call_args.args[0]
+        self.assertIn("gpt-5.6-sol", argv)
+        self.assertIn('model_reasoning_effort="low"', argv)

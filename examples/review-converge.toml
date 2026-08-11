@@ -1,6 +1,7 @@
 # Configuration is loaded only when passed with --config.
-reviewers = ["claude:sonnet", "codex"]
-final_decider = "codex"
+reviewers = ["claude:opus", "codex:gpt-5.6-sol"]
+final_decider = "codex:gpt-5.6-sol"
+codex_reasoning_effort = "low"
 rounds = 3
 timeout = 1800
 context_files = ["CONTRIBUTING.md"]
