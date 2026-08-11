@@ -368,19 +368,21 @@ def _copilot_content(events: list[dict[str, Any]]) -> str:
             if isinstance(json.loads(stripped), dict):
                 return stripped
         except json.JSONDecodeError:
-            match = re.fullmatch(
+            matches = re.finditer(
                 r"```(?:json)?[ \t]*\r?\n(?P<body>.*?)\r?\n```",
                 stripped,
                 flags=re.DOTALL | re.IGNORECASE,
             )
-            if match is None:
-                continue
-            fenced = match.group("body").strip()
-            try:
-                if isinstance(json.loads(fenced), dict):
-                    return fenced
-            except json.JSONDecodeError:
-                continue
+            valid: list[str] = []
+            for match in matches:
+                fenced = match.group("body").strip()
+                try:
+                    if isinstance(json.loads(fenced), dict):
+                        valid.append(fenced)
+                except json.JSONDecodeError:
+                    continue
+            if len(valid) == 1:
+                return valid[0]
     raise ConvergeError(
         "Copilot JSONL output did not contain a structured JSON response"
     )

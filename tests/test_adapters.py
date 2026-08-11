@@ -37,11 +37,23 @@ class CopilotAdapterTest(unittest.TestCase):
         ]
         self.assertEqual(_copilot_content(events), response)
 
-    def test_rejects_fenced_json_with_surrounding_prose(self):
+    def test_extracts_one_fenced_json_object_with_surrounding_prose(self):
         events = [
             {
                 "type": "assistant.message",
                 "data": {"content": 'Result:\n```json\n{"ok":true}\n```'},
+            }
+        ]
+        self.assertEqual(_copilot_content(events), '{"ok":true}')
+
+    def test_rejects_multiple_fenced_json_objects_as_ambiguous(self):
+        events = [
+            {
+                "type": "assistant.message",
+                "data": {
+                    "content": '```json\n{"first":true}\n```\n'
+                    '```json\n{"second":true}\n```'
+                },
             }
         ]
         with self.assertRaisesRegex(ConvergeError, "structured JSON response"):
