@@ -26,6 +26,7 @@ class Settings:
     rounds: int = 3
     timeout: int = 1800
     context_files: tuple[str, ...] = ()
+    instructions: tuple[str, ...] = ()
     fail_on: str | None = None
     claude_max_budget_usd: float | None = None
     copilot_max_ai_credits: float | None = None
@@ -40,6 +41,7 @@ ALLOWED_KEYS = frozenset(
         "rounds",
         "timeout",
         "context_files",
+        "instructions",
         "fail_on",
         "claude_max_budget_usd",
         "copilot_max_ai_credits",
@@ -58,6 +60,10 @@ def _validate(settings: Settings) -> Settings:
         raise ConvergeError("rounds must be between 0 and 10")
     if settings.timeout <= 0:
         raise ConvergeError("timeout must be positive")
+    if any(not instruction.strip() for instruction in settings.instructions):
+        raise ConvergeError("instructions must not contain empty values")
+    if sum(len(instruction) for instruction in settings.instructions) > 50_000:
+        raise ConvergeError("combined instructions must not exceed 50000 characters")
     if settings.structured_retries not in (0, 1):
         raise ConvergeError("structured_retries must be 0 or 1")
     if settings.codex_reasoning_effort not in (
@@ -123,6 +129,13 @@ def load_settings(path: Path | None) -> Settings:
         if not isinstance(files, list) or not all(isinstance(v, str) for v in files):
             raise ConvergeError("context_files must be an array of paths")
         values["context_files"] = tuple(files)
+    if "instructions" in values:
+        instructions = values["instructions"]
+        if not isinstance(instructions, list) or not all(
+            isinstance(value, str) for value in instructions
+        ):
+            raise ConvergeError("instructions must be an array of strings")
+        values["instructions"] = tuple(instructions)
     try:
         return _validate(replace(Settings(), **values))
     except TypeError as exc:
@@ -139,4 +152,6 @@ def override_settings(settings: Settings, **values: Any) -> Settings:
         supplied["final_decider"] = ReviewerSpec.parse(supplied["final_decider"])
     if "context_files" in supplied:
         supplied["context_files"] = tuple(supplied["context_files"])
+    if "instructions" in supplied:
+        supplied["instructions"] = tuple(supplied["instructions"])
     return _validate(replace(settings, **supplied))

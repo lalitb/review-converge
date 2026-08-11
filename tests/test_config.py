@@ -38,7 +38,8 @@ class ConfigurationTest(unittest.TestCase):
             path.write_text(
                 'reviewers = ["claude:sonnet", "codex"]\n'
                 'final_decider = "claude:opus"\nrounds = 2\n'
-                'context_files = ["CONTRIBUTING.md"]\n',
+                'context_files = ["CONTRIBUTING.md"]\n'
+                'instructions = ["Focus on compatibility"]\n',
                 encoding="utf-8",
             )
             configured = load_settings(path)
@@ -47,6 +48,7 @@ class ConfigurationTest(unittest.TestCase):
         self.assertEqual(resolved.fail_on, "high")
         self.assertEqual(resolved.reviewers[0].model, "sonnet")
         self.assertEqual(resolved.context_files, ("CONTRIBUTING.md",))
+        self.assertEqual(resolved.instructions, ("Focus on compatibility",))
 
     def test_exactly_two_distinct_reviewers(self):
         with self.assertRaisesRegex(ConvergeError, "Exactly two"):

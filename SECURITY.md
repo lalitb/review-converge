@@ -17,6 +17,8 @@ Local mode (`--local`) makes no GitHub API calls and performs no network fetch. 
 
 Configuration is loaded only from an explicit `--config` path. The tool never auto-loads configuration from the reviewed checkout. Context files must resolve inside that checkout and are copied and hashed before model invocation.
 
+`--instruction` and `--instruction-file` are trusted operator inputs. They may narrow review scope or add criteria, but prompts explicitly prevent them from overriding source-only and no-write constraints. Do not point `--instruction-file` at untrusted pull-request content; use `--context-file` for untrusted repository documentation.
+
 Copilot does not currently expose the same operating-system sandbox boundary as Codex. Its safety boundary is an availability filter that exposes only read, glob, and search, plus explicit denials for shell and edit tools. Because shell is unavailable, Copilot reviews the captured patch and readable checkout files but cannot use `git show` to inspect a pinned object that differs from the worktree. Verify the installed Copilot CLI version and organization policy recorded in `run.json`; use Codex when an OS-enforced read-only sandbox or pinned-object inspection is required.
 
 `--resume` verifies immutable inputs and completed artifact hashes before continuing. It fails closed if source, context, prompts, schemas, configuration, provider CLI versions, or recorded artifacts have changed.

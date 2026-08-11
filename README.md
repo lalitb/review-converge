@@ -132,6 +132,18 @@ review-converge --local --base main \
 
 Context paths must be files inside the checkout. Their copies and SHA-256 hashes are recorded, and a changed source or captured copy makes resume fail closed.
 
+## Custom review guidance
+
+Add trusted operator guidance inline or from a file:
+
+```sh
+review-converge --pr 1234 \
+  --instruction "Review as a maintainer; prioritize compatibility and shutdown behavior" \
+  --instruction-file /path/to/team-review-guidance.md
+```
+
+Both options are repeatable. Instructions are retained in `run.json`, included in resume compatibility checks, and applied to the independent reviews, reconciliation, and final decision. They may specialize the review but cannot enable checkout edits, builds, tests, network access, or GitHub writes. Only use `--instruction-file` with content you trust; repository source and `--context-file` content remain untrusted reference material rather than instructions.
+
 ## Convergence and final decision
 
 Initial reviews run concurrently. In each reconciliation round, both reviewers accept, reject, downgrade, or mark every namespaced finding as already covered. Early convergence requires:

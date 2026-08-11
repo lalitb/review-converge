@@ -472,14 +472,10 @@ def render_prompt(template_name: str, values: dict[str, str]) -> str:
         raise ConvergeError(
             f"Missing prompt values for {template_name}: {', '.join(missing)}"
         )
-    for key, value in values.items():
-        template = template.replace("{{" + key + "}}", value)
-    unresolved = PLACEHOLDER.findall(template)
-    if unresolved:
-        raise ConvergeError(
-            f"Unresolved placeholders in {template_name}: {', '.join(unresolved)}"
-        )
-    return template
+    return PLACEHOLDER.sub(
+        lambda match: values[match.group(0)[2:-2]],
+        template,
+    )
 
 
 def extract_claude_result(stdout: str) -> Any:
@@ -626,6 +622,7 @@ def settings_json(settings: Settings) -> dict[str, Any]:
         "rounds": settings.rounds,
         "timeout": settings.timeout,
         "context_files": list(settings.context_files),
+        "instructions": list(settings.instructions),
         "fail_on": settings.fail_on,
         "claude_max_budget_usd": settings.claude_max_budget_usd,
         "copilot_max_ai_credits": settings.copilot_max_ai_credits,
@@ -642,6 +639,7 @@ def settings_from_json(value: dict[str, Any]) -> Settings:
         rounds=value["rounds"],
         timeout=value["timeout"],
         context_files=value["context_files"],
+        instructions=value.get("instructions", []),
         fail_on=value.get("fail_on"),
         claude_max_budget_usd=value.get("claude_max_budget_usd"),
         copilot_max_ai_credits=value.get("copilot_max_ai_credits"),
@@ -678,6 +676,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head", default="HEAD", help="local mode head ref")
     parser.add_argument("--include-dirty", action="store_true")
     parser.add_argument("--context-file", action="append")
+    parser.add_argument(
+        "--instruction",
+        action="append",
+        help="trusted operator review guidance; repeat as needed",
+    )
+    parser.add_argument(
+        "--instruction-file",
+        action="append",
+        type=Path,
+        help="read trusted operator guidance from a file; repeat as needed",
+    )
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--timeout", type=int)
@@ -711,6 +720,8 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
             or args.final_decider
             or args.rounds is not None
             or args.context_file
+            or args.instruction
+            or args.instruction_file
             or args.timeout is not None
             or args.claude_model
             or args.codex_model
@@ -726,6 +737,12 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         settings = settings_from_json(manifest["configuration"])
         return override_settings(settings, fail_on=args.fail_on)
     settings = load_settings(args.config.resolve() if args.config else None)
+    instructions = list(args.instruction or [])
+    for path in args.instruction_file or []:
+        try:
+            instructions.append(path.resolve().read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ConvergeError(f"Cannot read instruction file {path}: {exc}") from exc
     reviewers = args.reviewer
     if reviewers and (args.claude_model or args.codex_model):
         raise ConvergeError("--reviewer cannot be combined with legacy model flags")
@@ -741,6 +758,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         rounds=args.rounds,
         timeout=args.timeout,
         context_files=args.context_file,
+        instructions=instructions or None,
         fail_on=args.fail_on,
         claude_max_budget_usd=args.claude_max_budget_usd,
         copilot_max_ai_credits=args.copilot_max_ai_credits,
@@ -1015,6 +1033,14 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
             output_dir, final["verdict"], tuple(final.get("findings", []))
         )
     common = common_values(snapshot, repo_dir)
+    common["custom_instructions"] = (
+        "\n".join(
+            f"{index}. {instruction.strip()}"
+            for index, instruction in enumerate(settings.instructions, 1)
+        )
+        if settings.instructions
+        else "None supplied."
+    )
     initial: dict[str, dict[str, Any]] = {}
     calls: dict[str, Callable[[], InvocationResult]] = {}
     for reviewer in reviewers:

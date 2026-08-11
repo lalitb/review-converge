@@ -125,6 +125,16 @@ class HelpersTest(unittest.TestCase):
         with self.assertRaises(ConvergeError):
             render_prompt("review.md", {})
 
+    def test_render_prompt_preserves_placeholder_like_operator_text(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "custom.md").write_text("Guidance: {{value}}\n", encoding="utf-8")
+            with mock.patch("review_converge.cli.PROMPTS", root):
+                rendered = render_prompt(
+                    "custom.md", {"value": "Keep {{literal}} text"}
+                )
+        self.assertEqual(rendered, "Guidance: Keep {{literal}} text\n")
+
     def test_local_argument_validation(self):
         base = {
             "rounds": 3,
@@ -213,11 +223,18 @@ class LocalSnapshotTest(unittest.TestCase):
                         str(repo),
                         "--output-dir",
                         str(root / "out"),
+                        "--instruction",
+                        "Focus on compatibility",
                         "--dry-run",
                     ]
                 )
             self.assertEqual(result, 0)
             self.assertTrue((root / "out" / "snapshot.json").is_file())
+            manifest = json.loads((root / "out" / "run.json").read_text())
+            self.assertEqual(
+                manifest["configuration"]["instructions"],
+                ["Focus on compatibility"],
+            )
 
     def test_dirty_changes_require_opt_in(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -5,6 +5,7 @@ codex_reasoning_effort = "low"
 rounds = 3
 timeout = 1800
 context_files = ["CONTRIBUTING.md"]
+instructions = ["Review as a maintainer; prioritize behavioral and compatibility risks."]
 fail_on = "request_changes"
 
 # Optional per-invocation provider limits:
