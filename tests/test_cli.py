@@ -24,6 +24,7 @@ from review_converge.cli import (
     main,
     parse_repo,
     preflight_authentication,
+    print_final_report,
     render_prompt,
     response_decisions,
     run_all,
@@ -182,6 +183,49 @@ class HelpersTest(unittest.TestCase):
             self.assertRaisesRegex(ConvergeError, "codex login"),
         ):
             preflight_authentication({"r1": adapter}, Path("."), 10)
+
+    def test_final_report_renders_compact_plain_text(self):
+        final = {
+            "verdict": "request_changes",
+            "converged": False,
+            "remaining_disagreements": ["Severity remains disputed"],
+            "findings": [
+                {
+                    "severity": "high",
+                    "file": "src/worker.py",
+                    "line": 84,
+                    "claim": "Shutdown ignores cancellation.",
+                }
+            ],
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_final_report(final, Path("/tmp/final.md"), full=False, color=False)
+        rendered = output.getvalue()
+        self.assertIn("Final verdict: REQUEST CHANGES", rendered)
+        self.assertIn("HIGH    src/worker.py:84", rendered)
+        self.assertIn("Severity remains disputed", rendered)
+        self.assertIn("Full report: /tmp/final.md", rendered)
+        self.assertNotIn("\033[", rendered)
+
+    def test_print_report_includes_retained_markdown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "final.md"
+            path.write_text("# Full review\n\nDetails.\n", encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                print_final_report(
+                    {
+                        "verdict": "approve",
+                        "converged": True,
+                        "remaining_disagreements": [],
+                        "findings": [],
+                    },
+                    path,
+                    full=True,
+                    color=False,
+                )
+        self.assertIn("# Full review\n\nDetails.", output.getvalue())
 
     def test_artifact_paths_have_no_round_zero_special_case(self):
         root = Path("/tmp/output")

@@ -4,6 +4,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
@@ -588,6 +589,68 @@ def print_run_usage(output_dir: Path) -> None:
     print(f"Run usage: {count} invocations — {tokens}{suffix}", flush=True)
 
 
+def print_final_report(
+    final: dict[str, Any], markdown_path: Path, *, full: bool, color: bool | None = None
+) -> None:
+    """Render a compact final result, plus the retained Markdown on request."""
+    use_color = (
+        sys.stdout.isatty() and "NO_COLOR" not in os.environ if color is None else color
+    )
+
+    def styled(value: str, code: str) -> str:
+        return f"\033[{code}m{value}\033[0m" if use_color else value
+
+    verdict = str(final.get("verdict", "unknown"))
+    verdict_color = {
+        "approve": "32;1",
+        "comment": "33;1",
+        "request_changes": "31;1",
+    }.get(verdict, "1")
+    findings = final.get("findings", [])
+    if not isinstance(findings, list):
+        findings = []
+    disagreements = final.get("remaining_disagreements", [])
+    if not isinstance(disagreements, list):
+        disagreements = []
+    convergence = "converged" if final.get("converged") else "not converged"
+
+    print()
+    print(f"Final verdict: {styled(verdict.replace('_', ' ').upper(), verdict_color)}")
+    print(f"Convergence:   {convergence}")
+    print(f"Findings:      {len(findings)}")
+    if findings:
+        print()
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            severity = str(finding.get("severity", "unknown")).upper()
+            location = str(finding.get("file", "unknown"))
+            line = finding.get("line")
+            if isinstance(line, int):
+                location += f":{line}"
+            label_color = "31;1" if severity in ("BLOCKER", "HIGH") else "33;1"
+            print(f"  {styled(severity.ljust(7), label_color)} {location}")
+            claim = str(finding.get("claim", "")).strip()
+            if claim:
+                print(f"          {claim}")
+    if disagreements:
+        print()
+        print(f"Unresolved disagreements ({len(disagreements)}):")
+        for disagreement in disagreements:
+            print(f"  - {disagreement}")
+    print()
+    print(f"Full report: {markdown_path}")
+    if full:
+        try:
+            markdown = markdown_path.read_text(encoding="utf-8").rstrip()
+        except OSError as exc:
+            raise ConvergeError(
+                f"Cannot read final report {markdown_path}: {exc}"
+            ) from exc
+        print("\n" + styled("─" * 72, "2"))
+        print(markdown)
+
+
 def preflight_authentication(
     adapters: dict[str, ReviewerAdapter], repo_dir: Path, timeout: int
 ) -> None:
@@ -771,6 +834,7 @@ def build_parser() -> argparse.ArgumentParser:
   review-converge --pr 1234 --instruction "Prioritize API compatibility"
   review-converge --pr 1234 --instruction-file /path/to/guidance.md
   review-converge --resume /tmp/review-converge/pr-1234-run
+  review-converge --resume /tmp/review-converge/pr-1234-run --print-report
 
 defaults:
   reviewers:     claude:opus and codex:gpt-5.6-sol
@@ -887,6 +951,11 @@ exit codes:
         "--verbose",
         action="store_true",
         help="show resume reuse details and 10-second progress heartbeats",
+    )
+    parser.add_argument(
+        "--print-report",
+        action="store_true",
+        help="print the complete final Markdown report before exiting",
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
@@ -1221,7 +1290,7 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
         final = load_json(final_path)
         print("Run already complete; reusing existing final review.", flush=True)
         print_run_usage(output_dir)
-        print(f"Final review: {output_dir / 'final.md'}")
+        print_final_report(final, output_dir / "final.md", full=args.print_report)
         return ExecutionResult(
             output_dir, final["verdict"], tuple(final.get("findings", []))
         )
@@ -1447,7 +1516,11 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
     (output_dir / "final.md").write_text(markdown.rstrip() + "\n", encoding="utf-8")
     update_stage(output_dir, ("final",), artifact_descriptor(output_dir, final_path))
     print_run_usage(output_dir)
-    print(f"Final review: {output_dir / 'final.md'}")
+    print_final_report(
+        final_invocation.value,
+        output_dir / "final.md",
+        full=args.print_report,
+    )
     return ExecutionResult(
         output_dir,
         final_invocation.value["verdict"],

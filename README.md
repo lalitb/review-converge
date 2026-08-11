@@ -209,6 +209,8 @@ Outputs are written under the system temporary directory by default. Each run co
 
 Long-running stages print their active reviewer slots, a heartbeat every 30 seconds, completion duration, and provider-reported token/cost fields. Unknown fields remain `unknown`. Use `--verbose` for 10-second heartbeats and details about artifacts reused during resume. Prompts and raw provider output are not streamed to the terminal.
 
+After completion, the CLI prints a compact verdict, convergence state, and finding list. Use `--print-report` to also print the complete retained `final.md`; this works with a completed `--resume` directory without invoking a model. Interactive terminals receive minimal verdict/severity color unless `NO_COLOR` is set, while redirected and CI output remains plain text.
+
 ## Safety and cost
 
 - Codex runs in a read-only sandbox.
