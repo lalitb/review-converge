@@ -187,6 +187,8 @@ Outputs are written under the system temporary directory by default. Each run co
 - one pair of JSON artifacts per reconciliation round; and
 - `final.json` plus the maintainer-readable `final.md`.
 
+Long-running stages print their active reviewer slots, a heartbeat every 30 seconds, completion duration, and provider-reported token/cost fields. Unknown fields remain `unknown`. Use `--verbose` for 10-second heartbeats and details about artifacts reused during resume. Prompts and raw provider output are not streamed to the terminal.
+
 ## Safety and cost
 
 - Codex runs in a read-only sandbox.

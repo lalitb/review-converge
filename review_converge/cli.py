@@ -7,6 +7,7 @@ import json
 import re
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -499,17 +500,87 @@ def extract_claude_result(stdout: str) -> Any:
 
 def run_all(
     calls: dict[str, Callable[[], InvocationResult]],
+    *,
+    stage: str | None = None,
+    labels: dict[str, str] | None = None,
+    heartbeat_seconds: int = 30,
 ) -> tuple[dict[str, InvocationResult], dict[str, Exception]]:
+    labels = labels or {}
+    started = time.monotonic()
+    if stage:
+        participants = ", ".join(f"{slot}={labels.get(slot, slot)}" for slot in calls)
+        print(f"{stage} started: {participants}", flush=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as pool:
-        futures = {slot: pool.submit(call) for slot, call in calls.items()}
+        futures = {pool.submit(call): slot for slot, call in calls.items()}
+        pending = set(futures)
         completed: dict[str, InvocationResult] = {}
         failed: dict[str, Exception] = {}
-        for slot, future in futures.items():
-            try:
-                completed[slot] = future.result()
-            except Exception as exc:  # noqa: BLE001 - preserve each peer result before surfacing provider failures
-                failed[slot] = exc
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending,
+                timeout=heartbeat_seconds,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                waiting = ", ".join(sorted(futures[future] for future in pending))
+                elapsed = round(time.monotonic() - started)
+                print(f"{stage}: still waiting on {waiting} ({elapsed}s)", flush=True)
+                continue
+            for future in done:
+                slot = futures[future]
+                try:
+                    invocation = future.result()
+                    completed[slot] = invocation
+                    if stage:
+                        print(
+                            f"{stage}: {slot} completed in "
+                            f"{invocation.duration_seconds:.1f}s — "
+                            f"{format_usage(invocation)}",
+                            flush=True,
+                        )
+                except Exception as exc:  # noqa: BLE001 - preserve peer results before surfacing provider failures
+                    failed[slot] = exc
+                    if stage:
+                        print(f"{stage}: {slot} failed", flush=True)
         return completed, failed
+
+
+def format_usage(invocation: InvocationResult) -> str:
+    usage = invocation.usage
+    fields = (
+        ("input", usage.input_tokens),
+        ("cached", usage.cached_input_tokens),
+        ("output", usage.output_tokens),
+    )
+    tokens = ", ".join(
+        f"{name} {value if value is not None else 'unknown'}" for name, value in fields
+    )
+    extras = []
+    if usage.cost_usd is not None:
+        extras.append(f"reported cost ${usage.cost_usd:.6f}")
+    if usage.ai_credits is not None:
+        extras.append(f"AI credits {usage.ai_credits:g}")
+    return "tokens: " + tokens + ((" — " + ", ".join(extras)) if extras else "")
+
+
+def print_run_usage(output_dir: Path) -> None:
+    totals = load_json(output_dir / "usage.json").get("totals", {})
+    count = totals.get("invocation_count", 0)
+    fields = (
+        ("input", totals.get("input_tokens")),
+        ("cached", totals.get("cached_input_tokens")),
+        ("output", totals.get("output_tokens")),
+    )
+    tokens = ", ".join(
+        f"{name} {value if value is not None else 'unknown'}" for name, value in fields
+    )
+    extras = []
+    if totals.get("cost_usd") is not None:
+        extras.append(f"reported cost ${totals['cost_usd']:.6f}")
+    if totals.get("ai_credits") is not None:
+        extras.append(f"AI credits {totals['ai_credits']:g}")
+    suffix = (" — " + ", ".join(extras)) if extras else ""
+    print(f"Run usage: {count} invocations — {tokens}{suffix}", flush=True)
 
 
 def record_invocation_failures(
@@ -762,6 +833,11 @@ exit codes:
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="capture inputs without invoking models"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show resume reuse details and 10-second progress heartbeats",
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
@@ -1086,6 +1162,9 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
     final_path = output_dir / "final.json"
     if final_path.is_file():
         final = load_json(final_path)
+        print("Run already complete; reusing existing final review.", flush=True)
+        print_run_usage(output_dir)
+        print(f"Final review: {output_dir / 'final.md'}")
         return ExecutionResult(
             output_dir, final["verdict"], tuple(final.get("findings", []))
         )
@@ -1100,10 +1179,14 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
     )
     initial: dict[str, dict[str, Any]] = {}
     calls: dict[str, Callable[[], InvocationResult]] = {}
+    labels = {reviewer.slot: reviewer.spec.display_name for reviewer in reviewers}
+    heartbeat = 10 if args.verbose else 30
     for reviewer in reviewers:
         path = artifact_path(output_dir, 0, reviewer.slot)
         if path.is_file():
             initial[reviewer.slot] = load_json(path)
+            if args.verbose:
+                print(f"Initial reviews: reusing {path.name}", flush=True)
         else:
             prompt = render_prompt(
                 "review.md",
@@ -1116,7 +1199,16 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
             calls[reviewer.slot] = lambda a=adapters[reviewer.slot], p=prompt: a.invoke(
                 p, schemas["review"]
             )
-    completed, failed = run_all(calls) if calls else ({}, {})
+    completed, failed = (
+        run_all(
+            calls,
+            stage="Initial reviews",
+            labels=labels,
+            heartbeat_seconds=heartbeat,
+        )
+        if calls
+        else ({}, {})
+    )
     for slot, invocation in completed.items():
         path = artifact_path(output_dir, 0, slot)
         write_json(path, invocation.value)
@@ -1171,6 +1263,11 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
             path = artifact_path(output_dir, round_number, reviewer.slot)
             if path.is_file():
                 current[reviewer.slot] = load_json(path)
+                if args.verbose:
+                    print(
+                        f"Reconciliation round {round_number}: reusing {path.name}",
+                        flush=True,
+                    )
             else:
                 prompt = render_prompt(
                     "reconcile.md",
@@ -1183,7 +1280,16 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
                 calls[reviewer.slot] = lambda a=adapters[reviewer.slot], p=prompt: (
                     a.invoke(p, schemas["reconciliation"])
                 )
-        completed, failed = run_all(calls) if calls else ({}, {})
+        completed, failed = (
+            run_all(
+                calls,
+                stage=f"Reconciliation round {round_number}",
+                labels=labels,
+                heartbeat_seconds=heartbeat,
+            )
+            if calls
+            else ({}, {})
+        )
         for slot, invocation in completed.items():
             path = artifact_path(output_dir, round_number, slot)
             write_json(path, invocation.value)
@@ -1244,22 +1350,31 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
             "artifact_glob": str(output_dir / "round-*.json"),
         },
     )
-    try:
-        final_invocation = adapters[final_decider.slot].invoke(
-            final_prompt, schemas["final"]
-        )
-    except AdapterInvocationError as exc:
-        adapter = adapters[final_decider.slot]
-        record_invocation(
-            output_dir,
-            stage="final",
-            reviewer=adapter.reviewer,
-            cli_version=adapter.cli_version,
-            result=exc.result,
-            outcome="failed",
-            error=str(exc),
-        )
-        raise
+    final_completed, final_failed = run_all(
+        {
+            final_decider.slot: lambda: adapters[final_decider.slot].invoke(
+                final_prompt, schemas["final"]
+            )
+        },
+        stage="Final decision",
+        labels={final_decider.slot: final_decider.spec.display_name},
+        heartbeat_seconds=heartbeat,
+    )
+    if final_failed:
+        exc = final_failed[final_decider.slot]
+        if isinstance(exc, AdapterInvocationError):
+            adapter = adapters[final_decider.slot]
+            record_invocation(
+                output_dir,
+                stage="final",
+                reviewer=adapter.reviewer,
+                cli_version=adapter.cli_version,
+                result=exc.result,
+                outcome="failed",
+                error=str(exc),
+            )
+        raise_invocation_failures(final_failed)
+    final_invocation = final_completed[final_decider.slot]
     write_json(final_path, final_invocation.value)
     record_invocation(
         output_dir,
@@ -1273,6 +1388,7 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
         raise ConvergeError("Final output did not contain final_markdown")
     (output_dir / "final.md").write_text(markdown.rstrip() + "\n", encoding="utf-8")
     update_stage(output_dir, ("final",), artifact_descriptor(output_dir, final_path))
+    print_run_usage(output_dir)
     print(f"Final review: {output_dir / 'final.md'}")
     return ExecutionResult(
         output_dir,

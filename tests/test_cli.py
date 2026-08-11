@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import io
 import json
 import subprocess
 import tempfile
@@ -16,6 +18,7 @@ from review_converge.cli import (
     collect_review_threads,
     converged,
     extract_claude_result,
+    format_usage,
     graphql,
     main,
     parse_repo,
@@ -26,6 +29,7 @@ from review_converge.cli import (
     validate_review,
 )
 from review_converge.config import Settings
+from review_converge.models import InvocationResult, Usage
 from review_converge.schema import generate_schemas
 
 
@@ -111,6 +115,33 @@ class ConvergenceTest(unittest.TestCase):
 
 
 class HelpersTest(unittest.TestCase):
+    def test_progress_usage_formats_known_and_unknown_fields(self):
+        invocation = InvocationResult(
+            {},
+            Usage(input_tokens=10, output_tokens=5, cost_usd=0.25),
+            "model",
+            1.5,
+        )
+        self.assertEqual(
+            format_usage(invocation),
+            "tokens: input 10, cached unknown, output 5 — reported cost $0.250000",
+        )
+
+    def test_run_all_prints_stage_completion_and_tokens(self):
+        invocation = InvocationResult({}, Usage(output_tokens=5), "model", 1.5)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            completed, failed = run_all(
+                {"r1": lambda: invocation},
+                stage="Initial reviews",
+                labels={"r1": "claude:opus"},
+                heartbeat_seconds=1,
+            )
+        self.assertEqual(completed, {"r1": invocation})
+        self.assertFalse(failed)
+        self.assertIn("Initial reviews started: r1=claude:opus", output.getvalue())
+        self.assertIn("output 5", output.getvalue())
+
     def test_help_documents_defaults_guidance_safety_and_exit_codes(self):
         help_text = build_parser().format_help()
         for expected in (
