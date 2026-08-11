@@ -23,6 +23,7 @@ from review_converge.cli import (
     graphql,
     main,
     parse_repo,
+    pin_fetched_base,
     preflight_authentication,
     print_final_report,
     render_prompt,
@@ -480,6 +481,15 @@ class PaginationTest(unittest.TestCase):
 
 
 class GitHubSnapshotTest(unittest.TestCase):
+    def git(self, repo: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+
     def test_keeps_base_tip_and_merge_base_separate_without_fetch(self):
         metadata = {
             "number": 7,
@@ -514,6 +524,34 @@ class GitHubSnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot.base_tip_sha, "new-base-tip")
         self.assertEqual(snapshot.merge_base_sha, "old-merge-base")
         self.assertEqual(snapshot.pr, 7)
+
+    def test_pins_captured_base_when_base_branch_has_advanced(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            self.git(repo, "config", "user.name", "Test")
+            self.git(repo, "config", "user.email", "test@example.com")
+            (repo / "file.txt").write_text("base\n", encoding="utf-8")
+            self.git(repo, "add", "file.txt")
+            self.git(repo, "commit", "-qm", "captured base")
+            captured_base = self.git(repo, "rev-parse", "HEAD")
+            (repo / "file.txt").write_text("advanced\n", encoding="utf-8")
+            self.git(repo, "commit", "-qam", "advanced base")
+            fetched_base = self.git(repo, "rev-parse", "HEAD")
+            self.git(
+                repo,
+                "update-ref",
+                "refs/review-converge/base-tip-7",
+                fetched_base,
+            )
+            self.git(repo, "update-ref", "refs/review-converge/pr-7", fetched_base)
+
+            pin_fetched_base(repo, 7, captured_base, fetched_base, 10)
+            self.assertEqual(
+                self.git(repo, "rev-parse", "refs/review-converge/base-tip-7"),
+                captured_base,
+            )
 
 
 class SchemaTest(unittest.TestCase):

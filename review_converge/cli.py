@@ -172,6 +172,36 @@ def create_output_dir(path: Path) -> None:
         raise ConvergeError(f"Output directory already exists: {path}") from exc
 
 
+def pin_fetched_base(
+    repo_dir: Path, pr: int, captured_base: str, fetched_base: str, timeout: int
+) -> None:
+    if fetched_base == captured_base:
+        return
+    ancestor = run(
+        ["git", "merge-base", "--is-ancestor", captured_base, fetched_base],
+        cwd=repo_dir,
+        timeout=timeout,
+        check=False,
+    )
+    if ancestor.returncode:
+        raise ConvergeError(
+            "Captured PR base is not reachable from the fetched base branch; retry"
+        )
+    # GitHub's PR metadata may retain an earlier baseRefOid after the branch
+    # advances. Pin the audit ref to the exact SHA used by the captured metadata.
+    run(
+        [
+            "git",
+            "update-ref",
+            f"refs/review-converge/base-tip-{pr}",
+            captured_base,
+            fetched_base,
+        ],
+        cwd=repo_dir,
+        timeout=timeout,
+    )
+
+
 def snapshot_constraints() -> dict[str, bool]:
     return {
         "source_only": True,
@@ -239,10 +269,11 @@ def collect_github_snapshot(
         fetched_base = git_output(
             repo_dir, ["rev-parse", f"refs/review-converge/base-tip-{pr}"], timeout
         )
-        if fetched_head != head_sha or fetched_base != base_tip_sha:
+        if fetched_head != head_sha:
             raise ConvergeError(
-                "Fetched PR refs do not match captured GitHub metadata; retry"
+                "Fetched PR head does not match captured GitHub metadata; retry"
             )
+        pin_fetched_base(repo_dir, pr, base_tip_sha, fetched_base, timeout)
         local_merge_base = git_output(
             repo_dir,
             [
