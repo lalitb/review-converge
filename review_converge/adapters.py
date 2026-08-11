@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -362,11 +363,24 @@ def _copilot_content(events: list[dict[str, Any]]) -> str:
 
     visit(events)
     for candidate in reversed(candidates):
+        stripped = candidate.strip()
         try:
-            if isinstance(json.loads(candidate.strip()), dict):
-                return candidate
+            if isinstance(json.loads(stripped), dict):
+                return stripped
         except json.JSONDecodeError:
-            continue
+            match = re.fullmatch(
+                r"```(?:json)?[ \t]*\r?\n(?P<body>.*?)\r?\n```",
+                stripped,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if match is None:
+                continue
+            fenced = match.group("body").strip()
+            try:
+                if isinstance(json.loads(fenced), dict):
+                    return fenced
+            except json.JSONDecodeError:
+                continue
     raise ConvergeError(
         "Copilot JSONL output did not contain a structured JSON response"
     )

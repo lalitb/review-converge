@@ -27,6 +27,26 @@ class CopilotAdapterTest(unittest.TestCase):
         events = [{"type": "assistant.message", "data": {"content": response}}]
         self.assertEqual(_copilot_content(events), response)
 
+    def test_extracts_single_json_fence_from_copilot_response(self):
+        response = '{"reviewer":"r1","findings":[]}'
+        events = [
+            {
+                "type": "assistant.message",
+                "data": {"content": f"```json\n{response}\n```"},
+            }
+        ]
+        self.assertEqual(_copilot_content(events), response)
+
+    def test_rejects_fenced_json_with_surrounding_prose(self):
+        events = [
+            {
+                "type": "assistant.message",
+                "data": {"content": 'Result:\n```json\n{"ok":true}\n```'},
+            }
+        ]
+        with self.assertRaisesRegex(ConvergeError, "structured JSON response"):
+            _copilot_content(events)
+
     def test_permission_argv_is_read_only_and_model_is_explicit(self):
         event = (
             json.dumps({"type": "assistant.message", "data": {"content": "{}"}}) + "\n"
