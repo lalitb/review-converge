@@ -14,7 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .adapters import AdapterInvocationError, ReviewerAdapter, make_adapter
+from .adapters import (
+    AdapterInvocationError,
+    ReviewerAdapter,
+    authentication_status,
+    make_adapter,
+)
 from .artifacts import (
     artifact_descriptor,
     capture_context,
@@ -26,7 +31,7 @@ from .artifacts import (
     verify_context,
     verify_recorded_artifacts,
 )
-from .config import Settings, load_settings, override_settings
+from .config import Settings, apply_review_profile, load_settings, override_settings
 from .core import ConvergeError, atomic_write_json, load_json, run, sha256_file
 from .models import (
     REVIEWER_SLOTS,
@@ -583,6 +588,36 @@ def print_run_usage(output_dir: Path) -> None:
     print(f"Run usage: {count} invocations — {tokens}{suffix}", flush=True)
 
 
+def preflight_authentication(
+    adapters: dict[str, ReviewerAdapter], repo_dir: Path, timeout: int
+) -> None:
+    providers = list(
+        dict.fromkeys(adapter.reviewer.spec.provider for adapter in adapters.values())
+    )
+    print("Authentication preflight:", flush=True)
+    failed: list[str] = []
+    for provider in providers:
+        status = authentication_status(provider, repo_dir, timeout)
+        if status is None:
+            print(
+                f"  {provider}: no non-interactive status command; checked on invocation",
+                flush=True,
+            )
+            continue
+        label = "authenticated" if status.authenticated else "not authenticated"
+        print(f"  {provider}: {label} ({status.detail})", flush=True)
+        if not status.authenticated:
+            failed.append(provider)
+    if failed:
+        commands = ", ".join(
+            "claude auth login" if provider == "claude" else "codex login"
+            for provider in failed
+        )
+        raise ConvergeError(
+            f"Authentication preflight failed for {', '.join(failed)}; run: {commands}"
+        )
+
+
 def record_invocation_failures(
     output_dir: Path,
     stage: str,
@@ -694,6 +729,7 @@ def settings_json(settings: Settings) -> dict[str, Any]:
         "timeout": settings.timeout,
         "context_files": list(settings.context_files),
         "instructions": list(settings.instructions),
+        "review_profile": settings.review_profile,
         "fail_on": settings.fail_on,
         "claude_max_budget_usd": settings.claude_max_budget_usd,
         "copilot_max_ai_credits": settings.copilot_max_ai_credits,
@@ -711,6 +747,7 @@ def settings_from_json(value: dict[str, Any]) -> Settings:
         timeout=value["timeout"],
         context_files=value["context_files"],
         instructions=value.get("instructions", []),
+        review_profile=value.get("review_profile"),
         fail_on=value.get("fail_on"),
         claude_max_budget_usd=value.get("claude_max_budget_usd"),
         copilot_max_ai_credits=value.get("copilot_max_ai_credits"),
@@ -730,6 +767,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""examples:
   review-converge --pr 1234
   review-converge --local --base main
+  review-converge --local --base main --review-profile cheap
   review-converge --pr 1234 --instruction "Prioritize API compatibility"
   review-converge --pr 1234 --instruction-file /path/to/guidance.md
   review-converge --resume /tmp/review-converge/pr-1234-run
@@ -739,6 +777,12 @@ defaults:
   final decider: codex:gpt-5.6-sol
   Codex effort:  low
   rounds:        3
+
+review profiles:
+  cheap:         Claude Sonnet + Codex low, no reconciliation (max 3 calls)
+  balanced:      Claude Sonnet + Codex low, 1 round (max 5 calls)
+  thorough:      Claude Opus + Codex medium, 3 rounds (max 9 calls)
+  Profiles reduce relative effort; they are not exact cross-provider token caps.
 
 safety:
   Reviewers cannot edit the checkout, build, test, post to GitHub, or change refs.
@@ -761,6 +805,11 @@ exit codes:
         "--resume", type=Path, help="resume a compatible artifact directory"
     )
     parser.add_argument("--config", type=Path, help="explicit TOML configuration file")
+    parser.add_argument(
+        "--review-profile",
+        choices=("cheap", "balanced", "thorough"),
+        help="cost/effort preset; explicit flags override the preset",
+    )
     parser.add_argument(
         "--reviewer", action="append", help="provider[:model]; specify exactly twice"
     )
@@ -850,6 +899,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         if (
             args.config
             or args.reviewer
+            or args.review_profile
             or args.final_decider
             or args.rounds is not None
             or args.context_file
@@ -870,6 +920,8 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         settings = settings_from_json(manifest["configuration"])
         return override_settings(settings, fail_on=args.fail_on)
     settings = load_settings(args.config.resolve() if args.config else None)
+    if args.review_profile:
+        settings = apply_review_profile(settings, args.review_profile)
     instructions = list(args.instruction or [])
     for path in args.instruction_file or []:
         try:
@@ -880,9 +932,14 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
     if reviewers and (args.claude_model or args.codex_model):
         raise ConvergeError("--reviewer cannot be combined with legacy model flags")
     if not reviewers and (args.claude_model or args.codex_model):
+        configured = settings.reviewers
         reviewers = [
-            f"claude:{args.claude_model}" if args.claude_model else "claude",
-            f"codex:{args.codex_model}" if args.codex_model else "codex",
+            f"claude:{args.claude_model}"
+            if args.claude_model
+            else configured[0].display_name,
+            f"codex:{args.codex_model}"
+            if args.codex_model
+            else configured[1].display_name,
         ]
     return override_settings(
         settings,
@@ -1168,6 +1225,7 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
         return ExecutionResult(
             output_dir, final["verdict"], tuple(final.get("findings", []))
         )
+    preflight_authentication(adapters, repo_dir, settings.timeout)
     common = common_values(snapshot, repo_dir)
     common["custom_instructions"] = (
         "\n".join(

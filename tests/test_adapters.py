@@ -7,10 +7,12 @@ from unittest import mock
 
 from review_converge.adapters import (
     AdapterInvocationError,
+    AuthenticationStatus,
     ClaudeAdapter,
     CodexAdapter,
     CopilotAdapter,
     _copilot_content,
+    authentication_status,
 )
 from review_converge.core import ConvergeError
 from review_converge.models import Reviewer, ReviewerSpec
@@ -78,6 +80,35 @@ class CopilotAdapterTest(unittest.TestCase):
             ):
                 adapter.invoke("prompt", schema)
             self.assertEqual(invoke.call_count, 1)
+
+
+class AuthenticationStatusTest(unittest.TestCase):
+    def test_claude_status_parses_method_without_exposing_credentials(self):
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps({"loggedIn": True, "authMethod": "oauth"}),
+            stderr="",
+        )
+        with mock.patch(
+            "review_converge.adapters.run", return_value=completed
+        ) as runner:
+            status = authentication_status("claude", Path("."), 10)
+        self.assertEqual(status, AuthenticationStatus("claude", True, "oauth"))
+        self.assertEqual(
+            runner.call_args.args[0], ["claude", "auth", "status", "--json"]
+        )
+
+    def test_codex_status_parses_login_type(self):
+        completed = subprocess.CompletedProcess(
+            [], 0, stdout="Logged in using ChatGPT\n", stderr=""
+        )
+        with mock.patch("review_converge.adapters.run", return_value=completed):
+            status = authentication_status("codex", Path("."), 10)
+        self.assertEqual(status, AuthenticationStatus("codex", True, "ChatGPT"))
+
+    def test_copilot_has_no_noninteractive_status(self):
+        self.assertIsNone(authentication_status("copilot", Path("."), 10))
 
 
 class FailedUsageTest(unittest.TestCase):

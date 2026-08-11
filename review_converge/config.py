@@ -27,6 +27,7 @@ class Settings:
     timeout: int = 1800
     context_files: tuple[str, ...] = ()
     instructions: tuple[str, ...] = ()
+    review_profile: str | None = None
     fail_on: str | None = None
     claude_max_budget_usd: float | None = None
     copilot_max_ai_credits: float | None = None
@@ -42,6 +43,7 @@ ALLOWED_KEYS = frozenset(
         "timeout",
         "context_files",
         "instructions",
+        "review_profile",
         "fail_on",
         "claude_max_budget_usd",
         "copilot_max_ai_credits",
@@ -60,6 +62,8 @@ def _validate(settings: Settings) -> Settings:
         raise ConvergeError("rounds must be between 0 and 10")
     if settings.timeout <= 0:
         raise ConvergeError("timeout must be positive")
+    if settings.review_profile not in (None, "cheap", "balanced", "thorough"):
+        raise ConvergeError("review_profile must be cheap, balanced, or thorough")
     if any(not instruction.strip() for instruction in settings.instructions):
         raise ConvergeError("instructions must not contain empty values")
     if sum(len(instruction) for instruction in settings.instructions) > 50_000:
@@ -111,6 +115,8 @@ def load_settings(path: Path | None) -> Settings:
     if unknown:
         raise ConvergeError(f"Unknown configuration keys: {', '.join(unknown)}")
     values: dict[str, Any] = dict(data)
+    profile = values.pop("review_profile", None)
+    settings = apply_review_profile(Settings(), profile) if profile else Settings()
     if "reviewers" in values:
         reviewers = values["reviewers"]
         if not isinstance(reviewers, list) or not all(
@@ -137,7 +143,7 @@ def load_settings(path: Path | None) -> Settings:
             raise ConvergeError("instructions must be an array of strings")
         values["instructions"] = tuple(instructions)
     try:
-        return _validate(replace(Settings(), **values))
+        return _validate(replace(settings, **values))
     except TypeError as exc:
         raise ConvergeError(f"Invalid configuration values: {exc}") from exc
 
@@ -155,3 +161,31 @@ def override_settings(settings: Settings, **values: Any) -> Settings:
     if "instructions" in supplied:
         supplied["instructions"] = tuple(supplied["instructions"])
     return _validate(replace(settings, **supplied))
+
+
+def apply_review_profile(settings: Settings, profile: str) -> Settings:
+    codex = ReviewerSpec("codex", "gpt-5.6-sol")
+    if profile == "cheap":
+        values = {
+            "reviewers": (ReviewerSpec("claude", "sonnet"), codex),
+            "final_decider": codex,
+            "rounds": 0,
+            "codex_reasoning_effort": "low",
+        }
+    elif profile == "balanced":
+        values = {
+            "reviewers": (ReviewerSpec("claude", "sonnet"), codex),
+            "final_decider": codex,
+            "rounds": 1,
+            "codex_reasoning_effort": "low",
+        }
+    elif profile == "thorough":
+        values = {
+            "reviewers": (ReviewerSpec("claude", "opus"), codex),
+            "final_decider": codex,
+            "rounds": 3,
+            "codex_reasoning_effort": "medium",
+        }
+    else:
+        raise ConvergeError(f"Unknown review profile: {profile}")
+    return _validate(replace(settings, review_profile=profile, **values))

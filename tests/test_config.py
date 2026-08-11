@@ -2,7 +2,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from review_converge.config import Settings, load_settings, override_settings
+from review_converge.config import (
+    Settings,
+    apply_review_profile,
+    load_settings,
+    override_settings,
+)
 from review_converge.core import ConvergeError
 from review_converge.models import ReviewerSpec
 
@@ -49,6 +54,29 @@ class ConfigurationTest(unittest.TestCase):
         self.assertEqual(resolved.reviewers[0].model, "sonnet")
         self.assertEqual(resolved.context_files, ("CONTRIBUTING.md",))
         self.assertEqual(resolved.instructions, ("Focus on compatibility",))
+
+    def test_review_profiles_bound_models_effort_rounds_and_invocations(self):
+        expected = {
+            "cheap": ("claude:sonnet", "low", 0, 3),
+            "balanced": ("claude:sonnet", "low", 1, 5),
+            "thorough": ("claude:opus", "medium", 3, 9),
+        }
+        for profile, (claude, effort, rounds, calls) in expected.items():
+            with self.subTest(profile=profile):
+                settings = apply_review_profile(Settings(), profile)
+                self.assertEqual(settings.reviewers[0].display_name, claude)
+                self.assertEqual(settings.codex_reasoning_effort, effort)
+                self.assertEqual(settings.rounds, rounds)
+                self.assertEqual(3 + 2 * settings.rounds, calls)
+
+    def test_toml_profile_can_be_overridden_by_explicit_toml_values(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "review.toml"
+            path.write_text('review_profile = "cheap"\nrounds = 2\n', encoding="utf-8")
+            settings = load_settings(path)
+        self.assertEqual(settings.review_profile, "cheap")
+        self.assertEqual(settings.reviewers[0].display_name, "claude:sonnet")
+        self.assertEqual(settings.rounds, 2)
 
     def test_exactly_two_distinct_reviewers(self):
         with self.assertRaisesRegex(ConvergeError, "Exactly two"):

@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from review_converge.adapters import AuthenticationStatus
 from review_converge.cli import (
     SCHEMAS,
     ConvergeError,
@@ -22,6 +23,7 @@ from review_converge.cli import (
     graphql,
     main,
     parse_repo,
+    preflight_authentication,
     render_prompt,
     response_decisions,
     run_all,
@@ -29,7 +31,7 @@ from review_converge.cli import (
     validate_review,
 )
 from review_converge.config import Settings
-from review_converge.models import InvocationResult, Usage
+from review_converge.models import InvocationResult, Reviewer, ReviewerSpec, Usage
 from review_converge.schema import generate_schemas
 
 
@@ -146,12 +148,40 @@ class HelpersTest(unittest.TestCase):
         help_text = build_parser().format_help()
         for expected in (
             "claude:opus and codex:gpt-5.6-sol",
+            "cheap:",
+            "not exact cross-provider token caps",
             "--instruction-file",
             "cannot override these constraints",
             "review completed but failed --fail-on",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, help_text)
+
+    def test_auth_preflight_prints_non_secret_login_methods(self):
+        reviewer = Reviewer("r1", ReviewerSpec.parse("claude:opus"))
+        adapter = mock.Mock(reviewer=reviewer)
+        output = io.StringIO()
+        with (
+            mock.patch(
+                "review_converge.cli.authentication_status",
+                return_value=AuthenticationStatus("claude", True, "oauth"),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            preflight_authentication({"r1": adapter}, Path("."), 10)
+        self.assertIn("claude: authenticated (oauth)", output.getvalue())
+
+    def test_auth_preflight_fails_before_review_when_logged_out(self):
+        reviewer = Reviewer("r1", ReviewerSpec.parse("codex:gpt-5.6-sol"))
+        adapter = mock.Mock(reviewer=reviewer)
+        with (
+            mock.patch(
+                "review_converge.cli.authentication_status",
+                return_value=AuthenticationStatus("codex", False, "not logged in"),
+            ),
+            self.assertRaisesRegex(ConvergeError, "codex login"),
+        ):
+            preflight_authentication({"r1": adapter}, Path("."), 10)
 
     def test_artifact_paths_have_no_round_zero_special_case(self):
         root = Path("/tmp/output")

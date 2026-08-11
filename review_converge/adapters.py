@@ -19,6 +19,56 @@ class ReviewerAdapter(Protocol):
     def invoke(self, prompt: str, schema_path: Path) -> InvocationResult: ...
 
 
+@dataclass(frozen=True)
+class AuthenticationStatus:
+    provider: str
+    authenticated: bool
+    detail: str
+
+
+def authentication_status(
+    provider: str, repo_dir: Path, timeout: int
+) -> AuthenticationStatus | None:
+    """Return a non-billable CLI authentication status when supported."""
+    if provider == "claude":
+        result = run(
+            ["claude", "auth", "status", "--json"],
+            cwd=repo_dir,
+            timeout=timeout,
+            check=False,
+        )
+        try:
+            value = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ConvergeError(
+                "Claude authentication status returned invalid JSON"
+            ) from exc
+        if not isinstance(value, dict) or not isinstance(value.get("loggedIn"), bool):
+            raise ConvergeError("Claude authentication status was incomplete")
+        method = value.get("authMethod")
+        detail = (
+            method if isinstance(method, str) and method != "none" else "not logged in"
+        )
+        return AuthenticationStatus("claude", value["loggedIn"], detail)
+    if provider == "codex":
+        result = run(
+            ["codex", "login", "status"],
+            cwd=repo_dir,
+            timeout=timeout,
+            check=False,
+        )
+        text = (result.stdout.strip() or result.stderr.strip()).splitlines()
+        detail = text[-1] if text else "status unavailable"
+        if result.returncode:
+            detail = "not logged in"
+        elif detail.lower().startswith("logged in using "):
+            detail = detail[len("Logged in using ") :]
+        return AuthenticationStatus("codex", result.returncode == 0, detail)
+    if provider == "copilot":
+        return None
+    raise ConvergeError(f"Unsupported authentication provider: {provider}")
+
+
 class AdapterInvocationError(ConvergeError):
     """Provider failure carrying billable usage observed before failure."""
 

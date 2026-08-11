@@ -23,6 +23,8 @@ All inputs, model outputs, and the final report are retained as an auditable sna
 
 The default Claude/Codex installation has no unconditional third-party runtime dependencies. Python 3.10 installs the `tomli` compatibility package. Copilot support uses the optional `jsonschema` validator.
 
+Before paid review calls, the tool runs the non-billable authentication status commands provided by Claude and Codex and prints only the login method, never credentials or tokens. Copilot has no equivalent non-interactive status command, so its authentication is checked by its first invocation.
+
 ## Installation
 
 From a source checkout:
@@ -119,6 +121,24 @@ review-converge --config review-converge.toml --local --base main
 ```
 
 See [examples/review-converge.toml](examples/review-converge.toml). Configuration is never discovered automatically from the reviewed repository because pull-request content is untrusted. Command-line values override the selected file.
+
+## Review cost profiles
+
+Use a named profile when you want a simple effort/cost choice:
+
+```sh
+review-converge --local --base main --review-profile cheap
+review-converge --pr 1234 --review-profile balanced
+review-converge --pr 1234 --review-profile thorough
+```
+
+| Profile | Reviewers | Codex effort | Reconciliation | Maximum calls |
+| --- | --- | --- | ---: | ---: |
+| `cheap` | Claude Sonnet + Codex | low | 0 rounds | 3 |
+| `balanced` | Claude Sonnet + Codex | low | 1 round | 5 |
+| `thorough` | Claude Opus + Codex | medium | 3 rounds | 9 |
+
+The maximum is two initial reviews, two calls per reconciliation round, and one final decision. Reconciliation may stop early. Profiles are relative effort controls, not exact cross-provider token ceilings: the CLIs do not expose one portable token-limit mechanism. Explicit command-line flags override profile values. For tighter provider-specific control, use `--rounds`, `--codex-reasoning-effort`, `--claude-max-budget-usd`, and `--copilot-max-ai-credits`. Actual reported usage is printed during the run and retained in `usage.json`.
 
 ## Project context
 
