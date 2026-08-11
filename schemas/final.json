@@ -7,7 +7,26 @@
     "verdict": {"enum": ["approve", "comment", "request_changes"]},
     "converged": {"type": "boolean"},
     "remaining_disagreements": {"type": "array", "items": {"type": "string"}},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "source_ids": {"type": "array", "items": {"type": "string"}},
+          "severity": {"enum": ["blocker", "high", "medium", "low"]},
+          "file": {"type": "string"},
+          "line": {"type": ["integer", "null"]},
+          "claim": {"type": "string"},
+          "evidence": {"type": "string"},
+          "comment": {"type": "string"},
+          "thread_status": {"enum": ["new", "already_covered", "resolved", "outdated"]}
+        },
+        "required": ["id", "source_ids", "severity", "file", "line", "claim", "evidence", "comment", "thread_status"]
+      }
+    },
     "final_markdown": {"type": "string"}
   },
-  "required": ["head_sha", "verdict", "converged", "remaining_disagreements", "final_markdown"]
+  "required": ["head_sha", "verdict", "converged", "remaining_disagreements", "findings", "final_markdown"]
 }
