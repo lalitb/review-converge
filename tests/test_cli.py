@@ -159,6 +159,13 @@ class HelpersTest(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertIn(expected, help_text)
 
+    def test_main_dispatches_session_subcommand(self):
+        with mock.patch(
+            "review_converge.session.session_main", return_value=7
+        ) as entry:
+            self.assertEqual(main(["session", "--resume", "/tmp/example"]), 7)
+        entry.assert_called_once_with(["--resume", "/tmp/example"])
+
     def test_auth_preflight_prints_non_secret_login_methods(self):
         reviewer = Reviewer("r1", ReviewerSpec.parse("claude:opus"))
         adapter = mock.Mock(reviewer=reviewer)

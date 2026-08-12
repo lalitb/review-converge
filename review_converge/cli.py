@@ -861,6 +861,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""examples:
   review-converge --pr 1234
   review-converge --local --base main
+  review-converge session --new /tmp/change-session --base main
   review-converge --local --base main --review-profile cheap
   review-converge --pr 1234 --instruction "Prioritize API compatibility"
   review-converge --pr 1234 --instruction-file /path/to/guidance.md
@@ -1560,8 +1561,13 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(argv) if argv is not None else sys.argv[1:]
+    if arguments and arguments[0] == "session":
+        from .session import session_main
+
+        return session_main(arguments[1:])
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     try:
         result = execute(args)
         settings = resolve_settings(args)

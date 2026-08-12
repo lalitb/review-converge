@@ -14,6 +14,57 @@ A second model is useful only when it independently checks the evidence. This to
 
 All inputs, model outputs, and the final report are retained as an auditable snapshot. See [an example final report](examples/final.md).
 
+## Maintainer workbench sessions
+
+The optional session REPL extends the same auditable, evidence-first model to
+explanation, challenge, patch proposal, patch application, and independent
+re-review. It does not enable shell execution, builds, tests, commits, pushes,
+GitHub posts, or other publication operations.
+
+Start a durable session with its artifacts outside the reviewed checkout:
+
+```sh
+review-converge session \
+  --new /tmp/my-change-session \
+  --repo-dir . \
+  --base main
+```
+
+The initial `review` capability is read-only. Escalate deliberately when a task
+needs a patch proposal or checkout mutation:
+
+```text
+rc> explain how shutdown ownership works
+rc> challenge the claim that this callback is serialized
+rc> mode propose
+rc> propose fix the accepted lifecycle finding with a minimal patch
+rc> diff proposal-001
+rc> mode edit
+rc> apply proposal-001 --yes
+rc> checkpoint
+rc> review
+rc> export markdown
+```
+
+Commands may optionally begin with `/`. Resume later with:
+
+```sh
+review-converge session --resume /tmp/my-change-session
+```
+
+Every command and capability change is appended to `events.jsonl`. Agent
+responses, immutable patch proposals, checkpoints, nested review runs, generated
+schemas, and `summary.md` are retained beneath the session directory. Applying a
+proposal requires `edit` mode, explicit `--yes`, an unchanged SHA-256-verified
+patch, and a successful `git apply --check`.
+
+Use `--command` for scripting or inspecting a session without an interactive
+terminal:
+
+```sh
+review-converge session --resume /tmp/my-change-session --command status
+```
+
 ## Requirements
 
 - Python 3.10+

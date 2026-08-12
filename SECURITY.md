@@ -25,4 +25,12 @@ Copilot does not currently expose the same operating-system sandbox boundary as 
 
 These controls reduce risk but do not make arbitrary repository content trusted. Run the tool only in repositories you are willing to expose to both configured model providers. Review CLI configuration, hooks, plugins, MCP servers, and organization policies before use. Never place API keys in the repository or command arguments.
 
+Maintainer workbench sessions start in read-only `review` mode. `propose` mode
+allows an agent to create a unified-diff artifact but does not modify the
+checkout. `edit` mode permits only application of a previously recorded patch;
+the operator must name the proposal and pass `--yes`. Before application, the
+tool verifies the recorded SHA-256 digest and runs `git apply --check`. Sessions
+must be stored outside the reviewed checkout and never expose arbitrary shell,
+build, test, commit, push, or GitHub-write commands.
+
 Report vulnerabilities privately to the repository maintainers rather than opening a public issue with exploit details.
