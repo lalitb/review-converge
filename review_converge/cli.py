@@ -4,16 +4,23 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .adapters import AdapterInvocationError, ReviewerAdapter, make_adapter
+from .adapters import (
+    AdapterInvocationError,
+    ReviewerAdapter,
+    authentication_status,
+    make_adapter,
+)
 from .artifacts import (
     artifact_descriptor,
     capture_context,
@@ -25,7 +32,7 @@ from .artifacts import (
     verify_context,
     verify_recorded_artifacts,
 )
-from .config import Settings, load_settings, override_settings
+from .config import Settings, apply_review_profile, load_settings, override_settings
 from .core import ConvergeError, atomic_write_json, load_json, run, sha256_file
 from .models import (
     REVIEWER_SLOTS,
@@ -165,6 +172,36 @@ def create_output_dir(path: Path) -> None:
         raise ConvergeError(f"Output directory already exists: {path}") from exc
 
 
+def pin_fetched_base(
+    repo_dir: Path, pr: int, captured_base: str, fetched_base: str, timeout: int
+) -> None:
+    if fetched_base == captured_base:
+        return
+    ancestor = run(
+        ["git", "merge-base", "--is-ancestor", captured_base, fetched_base],
+        cwd=repo_dir,
+        timeout=timeout,
+        check=False,
+    )
+    if ancestor.returncode:
+        raise ConvergeError(
+            "Captured PR base is not reachable from the fetched base branch; retry"
+        )
+    # GitHub's PR metadata may retain an earlier baseRefOid after the branch
+    # advances. Pin the audit ref to the exact SHA used by the captured metadata.
+    run(
+        [
+            "git",
+            "update-ref",
+            f"refs/review-converge/base-tip-{pr}",
+            captured_base,
+            fetched_base,
+        ],
+        cwd=repo_dir,
+        timeout=timeout,
+    )
+
+
 def snapshot_constraints() -> dict[str, bool]:
     return {
         "source_only": True,
@@ -232,10 +269,11 @@ def collect_github_snapshot(
         fetched_base = git_output(
             repo_dir, ["rev-parse", f"refs/review-converge/base-tip-{pr}"], timeout
         )
-        if fetched_head != head_sha or fetched_base != base_tip_sha:
+        if fetched_head != head_sha:
             raise ConvergeError(
-                "Fetched PR refs do not match captured GitHub metadata; retry"
+                "Fetched PR head does not match captured GitHub metadata; retry"
             )
+        pin_fetched_base(repo_dir, pr, base_tip_sha, fetched_base, timeout)
         local_merge_base = git_output(
             repo_dir,
             [
@@ -472,14 +510,10 @@ def render_prompt(template_name: str, values: dict[str, str]) -> str:
         raise ConvergeError(
             f"Missing prompt values for {template_name}: {', '.join(missing)}"
         )
-    for key, value in values.items():
-        template = template.replace("{{" + key + "}}", value)
-    unresolved = PLACEHOLDER.findall(template)
-    if unresolved:
-        raise ConvergeError(
-            f"Unresolved placeholders in {template_name}: {', '.join(unresolved)}"
-        )
-    return template
+    return PLACEHOLDER.sub(
+        lambda match: values[match.group(0)[2:-2]],
+        template,
+    )
 
 
 def extract_claude_result(stdout: str) -> Any:
@@ -503,17 +537,179 @@ def extract_claude_result(stdout: str) -> Any:
 
 def run_all(
     calls: dict[str, Callable[[], InvocationResult]],
+    *,
+    stage: str | None = None,
+    labels: dict[str, str] | None = None,
+    heartbeat_seconds: int = 30,
 ) -> tuple[dict[str, InvocationResult], dict[str, Exception]]:
+    labels = labels or {}
+    started = time.monotonic()
+    if stage:
+        participants = ", ".join(f"{slot}={labels.get(slot, slot)}" for slot in calls)
+        print(f"{stage} started: {participants}", flush=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as pool:
-        futures = {slot: pool.submit(call) for slot, call in calls.items()}
+        futures = {pool.submit(call): slot for slot, call in calls.items()}
+        pending = set(futures)
         completed: dict[str, InvocationResult] = {}
         failed: dict[str, Exception] = {}
-        for slot, future in futures.items():
-            try:
-                completed[slot] = future.result()
-            except Exception as exc:  # noqa: BLE001 - preserve each peer result before surfacing provider failures
-                failed[slot] = exc
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending,
+                timeout=heartbeat_seconds,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                waiting = ", ".join(sorted(futures[future] for future in pending))
+                elapsed = round(time.monotonic() - started)
+                print(f"{stage}: still waiting on {waiting} ({elapsed}s)", flush=True)
+                continue
+            for future in done:
+                slot = futures[future]
+                try:
+                    invocation = future.result()
+                    completed[slot] = invocation
+                    if stage:
+                        print(
+                            f"{stage}: {slot} completed in "
+                            f"{invocation.duration_seconds:.1f}s — "
+                            f"{format_usage(invocation)}",
+                            flush=True,
+                        )
+                except Exception as exc:  # noqa: BLE001 - preserve peer results before surfacing provider failures
+                    failed[slot] = exc
+                    if stage:
+                        print(f"{stage}: {slot} failed", flush=True)
         return completed, failed
+
+
+def format_usage(invocation: InvocationResult) -> str:
+    usage = invocation.usage
+    fields = (
+        ("input", usage.input_tokens),
+        ("cached", usage.cached_input_tokens),
+        ("output", usage.output_tokens),
+    )
+    tokens = ", ".join(
+        f"{name} {value if value is not None else 'unknown'}" for name, value in fields
+    )
+    extras = []
+    if usage.cost_usd is not None:
+        extras.append(f"reported cost ${usage.cost_usd:.6f}")
+    if usage.ai_credits is not None:
+        extras.append(f"AI credits {usage.ai_credits:g}")
+    return "tokens: " + tokens + ((" — " + ", ".join(extras)) if extras else "")
+
+
+def print_run_usage(output_dir: Path) -> None:
+    totals = load_json(output_dir / "usage.json").get("totals", {})
+    count = totals.get("invocation_count", 0)
+    fields = (
+        ("input", totals.get("input_tokens")),
+        ("cached", totals.get("cached_input_tokens")),
+        ("output", totals.get("output_tokens")),
+    )
+    tokens = ", ".join(
+        f"{name} {value if value is not None else 'unknown'}" for name, value in fields
+    )
+    extras = []
+    if totals.get("cost_usd") is not None:
+        extras.append(f"reported cost ${totals['cost_usd']:.6f}")
+    if totals.get("ai_credits") is not None:
+        extras.append(f"AI credits {totals['ai_credits']:g}")
+    suffix = (" — " + ", ".join(extras)) if extras else ""
+    print(f"Run usage: {count} invocations — {tokens}{suffix}", flush=True)
+
+
+def print_final_report(
+    final: dict[str, Any], markdown_path: Path, *, full: bool, color: bool | None = None
+) -> None:
+    """Render a compact final result, plus the retained Markdown on request."""
+    use_color = (
+        sys.stdout.isatty() and "NO_COLOR" not in os.environ if color is None else color
+    )
+
+    def styled(value: str, code: str) -> str:
+        return f"\033[{code}m{value}\033[0m" if use_color else value
+
+    verdict = str(final.get("verdict", "unknown"))
+    verdict_color = {
+        "approve": "32;1",
+        "comment": "33;1",
+        "request_changes": "31;1",
+    }.get(verdict, "1")
+    findings = final.get("findings", [])
+    if not isinstance(findings, list):
+        findings = []
+    disagreements = final.get("remaining_disagreements", [])
+    if not isinstance(disagreements, list):
+        disagreements = []
+    convergence = "converged" if final.get("converged") else "not converged"
+
+    print()
+    print(f"Final verdict: {styled(verdict.replace('_', ' ').upper(), verdict_color)}")
+    print(f"Convergence:   {convergence}")
+    print(f"Findings:      {len(findings)}")
+    if findings:
+        print()
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            severity = str(finding.get("severity", "unknown")).upper()
+            location = str(finding.get("file", "unknown"))
+            line = finding.get("line")
+            if isinstance(line, int):
+                location += f":{line}"
+            label_color = "31;1" if severity in ("BLOCKER", "HIGH") else "33;1"
+            print(f"  {styled(severity.ljust(7), label_color)} {location}")
+            claim = str(finding.get("claim", "")).strip()
+            if claim:
+                print(f"          {claim}")
+    if disagreements:
+        print()
+        print(f"Unresolved disagreements ({len(disagreements)}):")
+        for disagreement in disagreements:
+            print(f"  - {disagreement}")
+    print()
+    print(f"Full report: {markdown_path}")
+    if full:
+        try:
+            markdown = markdown_path.read_text(encoding="utf-8").rstrip()
+        except OSError as exc:
+            raise ConvergeError(
+                f"Cannot read final report {markdown_path}: {exc}"
+            ) from exc
+        print("\n" + styled("─" * 72, "2"))
+        print(markdown)
+
+
+def preflight_authentication(
+    adapters: dict[str, ReviewerAdapter], repo_dir: Path, timeout: int
+) -> None:
+    providers = list(
+        dict.fromkeys(adapter.reviewer.spec.provider for adapter in adapters.values())
+    )
+    print("Authentication preflight:", flush=True)
+    failed: list[str] = []
+    for provider in providers:
+        status = authentication_status(provider, repo_dir, timeout)
+        if status is None:
+            print(
+                f"  {provider}: no non-interactive status command; checked on invocation",
+                flush=True,
+            )
+            continue
+        label = "authenticated" if status.authenticated else "not authenticated"
+        print(f"  {provider}: {label} ({status.detail})", flush=True)
+        if not status.authenticated:
+            failed.append(provider)
+    if failed:
+        commands = ", ".join(
+            "claude auth login" if provider == "claude" else "codex login"
+            for provider in failed
+        )
+        raise ConvergeError(
+            f"Authentication preflight failed for {', '.join(failed)}; run: {commands}"
+        )
 
 
 def record_invocation_failures(
@@ -626,9 +822,12 @@ def settings_json(settings: Settings) -> dict[str, Any]:
         "rounds": settings.rounds,
         "timeout": settings.timeout,
         "context_files": list(settings.context_files),
+        "instructions": list(settings.instructions),
+        "review_profile": settings.review_profile,
         "fail_on": settings.fail_on,
         "claude_max_budget_usd": settings.claude_max_budget_usd,
         "copilot_max_ai_credits": settings.copilot_max_ai_credits,
+        "codex_reasoning_effort": settings.codex_reasoning_effort,
         "structured_retries": settings.structured_retries,
     }
 
@@ -641,9 +840,12 @@ def settings_from_json(value: dict[str, Any]) -> Settings:
         rounds=value["rounds"],
         timeout=value["timeout"],
         context_files=value["context_files"],
+        instructions=value.get("instructions", []),
+        review_profile=value.get("review_profile"),
         fail_on=value.get("fail_on"),
         claude_max_budget_usd=value.get("claude_max_budget_usd"),
         copilot_max_ai_credits=value.get("copilot_max_ai_credits"),
+        codex_reasoning_effort=value.get("codex_reasoning_effort", "low"),
         structured_retries=value.get("structured_retries", 1),
     )
 
@@ -651,7 +853,42 @@ def settings_from_json(value: dict[str, Any]) -> Settings:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="review-converge",
-        description="Converge two independent source-only reviews.",
+        description=(
+            "Run exactly two independent source-only reviews, reconcile their "
+            "findings, and produce an auditable maintainer verdict."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  review-converge --pr 1234
+  review-converge --local --base main
+  review-converge session --new /tmp/change-session --base main
+  review-converge --local --base main --review-profile cheap
+  review-converge --pr 1234 --instruction "Prioritize API compatibility"
+  review-converge --pr 1234 --instruction-file /path/to/guidance.md
+  review-converge --resume /tmp/review-converge/pr-1234-run
+  review-converge --resume /tmp/review-converge/pr-1234-run --print-report
+
+defaults:
+  reviewers:     claude:opus and codex:gpt-5.6-sol
+  final decider: codex:gpt-5.6-sol
+  Codex effort:  low
+  rounds:        3
+
+review profiles:
+  cheap:         Claude Sonnet + Codex low, no reconciliation (max 3 calls)
+  balanced:      Claude Sonnet + Codex low, 1 round (max 5 calls)
+  thorough:      Claude Opus + Codex medium, 3 rounds (max 9 calls)
+  Profiles reduce relative effort; they are not exact cross-provider token caps.
+
+safety:
+  Reviewers cannot edit the checkout, build, test, post to GitHub, or change refs.
+  Custom instructions may specialize a review but cannot override these constraints.
+
+exit codes:
+  0  review completed and passed any configured gate
+  1  operational, source, or validation failure
+  2  review completed but failed --fail-on
+""",
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--pr", type=int, help="GitHub pull request number")
@@ -665,32 +902,93 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", type=Path, help="explicit TOML configuration file")
     parser.add_argument(
+        "--review-profile",
+        choices=("cheap", "balanced", "thorough"),
+        help="cost/effort preset; explicit flags override the preset",
+    )
+    parser.add_argument(
         "--reviewer", action="append", help="provider[:model]; specify exactly twice"
     )
-    parser.add_argument("--final-decider", help="provider[:model]")
+    parser.add_argument(
+        "--final-decider",
+        help="final provider[:model] (default: codex:gpt-5.6-sol)",
+    )
     parser.add_argument("--repo", help="owner/repo; inferred from the current checkout")
     parser.add_argument(
         "--repo-dir", type=Path, default=Path.cwd(), help="local Git checkout"
     )
     parser.add_argument("--base", help="local mode base ref")
     parser.add_argument("--head", default="HEAD", help="local mode head ref")
-    parser.add_argument("--include-dirty", action="store_true")
-    parser.add_argument("--context-file", action="append")
-    parser.add_argument("--rounds", type=int)
-    parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--timeout", type=int)
+    parser.add_argument(
+        "--include-dirty",
+        action="store_true",
+        help="include tracked worktree changes; rejects untracked files",
+    )
+    parser.add_argument(
+        "--context-file",
+        action="append",
+        help="untrusted repository context file; repeat as needed",
+    )
+    parser.add_argument(
+        "--instruction",
+        action="append",
+        help="trusted operator review guidance; repeat as needed",
+    )
+    parser.add_argument(
+        "--instruction-file",
+        action="append",
+        type=Path,
+        help="read trusted operator guidance from a file; repeat as needed",
+    )
+    parser.add_argument("--rounds", type=int, help="reconciliation rounds (default: 3)")
+    parser.add_argument(
+        "--output-dir", type=Path, help="new artifact directory outside the checkout"
+    )
+    parser.add_argument("--timeout", type=int, help="seconds allowed per provider call")
     parser.add_argument(
         "--claude-model", help="legacy default-slot Claude model override"
     )
     parser.add_argument(
         "--codex-model", help="legacy default-slot Codex model override"
     )
-    parser.add_argument("--claude-max-budget-usd", type=float)
-    parser.add_argument("--copilot-max-ai-credits", type=float)
-    parser.add_argument("--structured-retries", type=int, choices=[0, 1])
-    parser.add_argument("--fail-on", choices=FAIL_CHOICES)
-    parser.add_argument("--no-fetch", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--claude-max-budget-usd", type=float, help="per-invocation Claude budget cap"
+    )
+    parser.add_argument(
+        "--copilot-max-ai-credits",
+        type=float,
+        help="per-invocation Copilot cap (minimum: 30)",
+    )
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        choices=("minimal", "low", "medium", "high", "xhigh"),
+        help="Codex reasoning effort (default: low)",
+    )
+    parser.add_argument(
+        "--structured-retries",
+        type=int,
+        choices=[0, 1],
+        help="Copilot JSON repair attempts (default: 1)",
+    )
+    parser.add_argument(
+        "--fail-on", choices=FAIL_CHOICES, help="return exit 2 when the gate matches"
+    )
+    parser.add_argument(
+        "--no-fetch", action="store_true", help="do not update local review refs"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="capture inputs without invoking models"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show resume reuse details and 10-second progress heartbeats",
+    )
+    parser.add_argument(
+        "--print-report",
+        action="store_true",
+        help="print the complete final Markdown report before exiting",
+    )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
     )
@@ -702,9 +1000,19 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         if (
             args.config
             or args.reviewer
+            or args.review_profile
             or args.final_decider
             or args.rounds is not None
             or args.context_file
+            or args.instruction
+            or args.instruction_file
+            or args.timeout is not None
+            or args.claude_model
+            or args.codex_model
+            or args.claude_max_budget_usd is not None
+            or args.copilot_max_ai_credits is not None
+            or args.codex_reasoning_effort is not None
+            or args.structured_retries is not None
         ):
             raise ConvergeError(
                 "--resume does not accept configuration overrides except --fail-on"
@@ -713,13 +1021,26 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         settings = settings_from_json(manifest["configuration"])
         return override_settings(settings, fail_on=args.fail_on)
     settings = load_settings(args.config.resolve() if args.config else None)
+    if args.review_profile:
+        settings = apply_review_profile(settings, args.review_profile)
+    instructions = list(args.instruction or [])
+    for path in args.instruction_file or []:
+        try:
+            instructions.append(path.resolve().read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ConvergeError(f"Cannot read instruction file {path}: {exc}") from exc
     reviewers = args.reviewer
     if reviewers and (args.claude_model or args.codex_model):
         raise ConvergeError("--reviewer cannot be combined with legacy model flags")
     if not reviewers and (args.claude_model or args.codex_model):
+        configured = settings.reviewers
         reviewers = [
-            f"claude:{args.claude_model}" if args.claude_model else "claude",
-            f"codex:{args.codex_model}" if args.codex_model else "codex",
+            f"claude:{args.claude_model}"
+            if args.claude_model
+            else configured[0].display_name,
+            f"codex:{args.codex_model}"
+            if args.codex_model
+            else configured[1].display_name,
         ]
     return override_settings(
         settings,
@@ -728,9 +1049,11 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         rounds=args.rounds,
         timeout=args.timeout,
         context_files=args.context_file,
+        instructions=instructions or None,
         fail_on=args.fail_on,
         claude_max_budget_usd=args.claude_max_budget_usd,
         copilot_max_ai_credits=args.copilot_max_ai_credits,
+        codex_reasoning_effort=args.codex_reasoning_effort,
         structured_retries=args.structured_retries,
     )
 
@@ -898,6 +1221,7 @@ def prepare_new_run(
             accessible_dirs=(output_dir,),
             claude_max_budget_usd=settings.claude_max_budget_usd,
             copilot_max_ai_credits=settings.copilot_max_ai_credits,
+            codex_reasoning_effort=settings.codex_reasoning_effort,
             structured_retries=settings.structured_retries,
         )
         for slot, reviewer in unique.items()
@@ -957,6 +1281,7 @@ def prepare_resume(
             accessible_dirs=(output_dir,),
             claude_max_budget_usd=settings.claude_max_budget_usd,
             copilot_max_ai_credits=settings.copilot_max_ai_credits,
+            codex_reasoning_effort=settings.codex_reasoning_effort,
             structured_retries=settings.structured_retries,
         )
         for slot, reviewer in unique.items()
@@ -995,16 +1320,32 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
     final_path = output_dir / "final.json"
     if final_path.is_file():
         final = load_json(final_path)
+        print("Run already complete; reusing existing final review.", flush=True)
+        print_run_usage(output_dir)
+        print_final_report(final, output_dir / "final.md", full=args.print_report)
         return ExecutionResult(
             output_dir, final["verdict"], tuple(final.get("findings", []))
         )
+    preflight_authentication(adapters, repo_dir, settings.timeout)
     common = common_values(snapshot, repo_dir)
+    common["custom_instructions"] = (
+        "\n".join(
+            f"{index}. {instruction.strip()}"
+            for index, instruction in enumerate(settings.instructions, 1)
+        )
+        if settings.instructions
+        else "None supplied."
+    )
     initial: dict[str, dict[str, Any]] = {}
     calls: dict[str, Callable[[], InvocationResult]] = {}
+    labels = {reviewer.slot: reviewer.spec.display_name for reviewer in reviewers}
+    heartbeat = 10 if args.verbose else 30
     for reviewer in reviewers:
         path = artifact_path(output_dir, 0, reviewer.slot)
         if path.is_file():
             initial[reviewer.slot] = load_json(path)
+            if args.verbose:
+                print(f"Initial reviews: reusing {path.name}", flush=True)
         else:
             prompt = render_prompt(
                 "review.md",
@@ -1017,7 +1358,16 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
             calls[reviewer.slot] = lambda a=adapters[reviewer.slot], p=prompt: a.invoke(
                 p, schemas["review"]
             )
-    completed, failed = run_all(calls) if calls else ({}, {})
+    completed, failed = (
+        run_all(
+            calls,
+            stage="Initial reviews",
+            labels=labels,
+            heartbeat_seconds=heartbeat,
+        )
+        if calls
+        else ({}, {})
+    )
     for slot, invocation in completed.items():
         path = artifact_path(output_dir, 0, slot)
         write_json(path, invocation.value)
@@ -1072,6 +1422,11 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
             path = artifact_path(output_dir, round_number, reviewer.slot)
             if path.is_file():
                 current[reviewer.slot] = load_json(path)
+                if args.verbose:
+                    print(
+                        f"Reconciliation round {round_number}: reusing {path.name}",
+                        flush=True,
+                    )
             else:
                 prompt = render_prompt(
                     "reconcile.md",
@@ -1084,7 +1439,16 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
                 calls[reviewer.slot] = lambda a=adapters[reviewer.slot], p=prompt: (
                     a.invoke(p, schemas["reconciliation"])
                 )
-        completed, failed = run_all(calls) if calls else ({}, {})
+        completed, failed = (
+            run_all(
+                calls,
+                stage=f"Reconciliation round {round_number}",
+                labels=labels,
+                heartbeat_seconds=heartbeat,
+            )
+            if calls
+            else ({}, {})
+        )
         for slot, invocation in completed.items():
             path = artifact_path(output_dir, round_number, slot)
             write_json(path, invocation.value)
@@ -1145,22 +1509,31 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
             "artifact_glob": str(output_dir / "round-*.json"),
         },
     )
-    try:
-        final_invocation = adapters[final_decider.slot].invoke(
-            final_prompt, schemas["final"]
-        )
-    except AdapterInvocationError as exc:
-        adapter = adapters[final_decider.slot]
-        record_invocation(
-            output_dir,
-            stage="final",
-            reviewer=adapter.reviewer,
-            cli_version=adapter.cli_version,
-            result=exc.result,
-            outcome="failed",
-            error=str(exc),
-        )
-        raise
+    final_completed, final_failed = run_all(
+        {
+            final_decider.slot: lambda: adapters[final_decider.slot].invoke(
+                final_prompt, schemas["final"]
+            )
+        },
+        stage="Final decision",
+        labels={final_decider.slot: final_decider.spec.display_name},
+        heartbeat_seconds=heartbeat,
+    )
+    if final_failed:
+        exc = final_failed[final_decider.slot]
+        if isinstance(exc, AdapterInvocationError):
+            adapter = adapters[final_decider.slot]
+            record_invocation(
+                output_dir,
+                stage="final",
+                reviewer=adapter.reviewer,
+                cli_version=adapter.cli_version,
+                result=exc.result,
+                outcome="failed",
+                error=str(exc),
+            )
+        raise_invocation_failures(final_failed)
+    final_invocation = final_completed[final_decider.slot]
     write_json(final_path, final_invocation.value)
     record_invocation(
         output_dir,
@@ -1174,7 +1547,12 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
         raise ConvergeError("Final output did not contain final_markdown")
     (output_dir / "final.md").write_text(markdown.rstrip() + "\n", encoding="utf-8")
     update_stage(output_dir, ("final",), artifact_descriptor(output_dir, final_path))
-    print(f"Final review: {output_dir / 'final.md'}")
+    print_run_usage(output_dir)
+    print_final_report(
+        final_invocation.value,
+        output_dir / "final.md",
+        full=args.print_report,
+    )
     return ExecutionResult(
         output_dir,
         final_invocation.value["verdict"],
@@ -1183,8 +1561,13 @@ def execute(args: argparse.Namespace) -> ExecutionResult:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(argv) if argv is not None else sys.argv[1:]
+    if arguments and arguments[0] == "session":
+        from .session import session_main
+
+        return session_main(arguments[1:])
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     try:
         result = execute(args)
         settings = resolve_settings(args)

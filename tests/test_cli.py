@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import io
 import json
 import subprocess
 import tempfile
@@ -6,18 +8,24 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from review_converge.adapters import AuthenticationStatus
 from review_converge.cli import (
     SCHEMAS,
     ConvergeError,
     artifact_path,
+    build_parser,
     collect_github_snapshot,
     collect_local_snapshot,
     collect_review_threads,
     converged,
     extract_claude_result,
+    format_usage,
     graphql,
     main,
     parse_repo,
+    pin_fetched_base,
+    preflight_authentication,
+    print_final_report,
     render_prompt,
     response_decisions,
     run_all,
@@ -25,6 +33,7 @@ from review_converge.cli import (
     validate_review,
 )
 from review_converge.config import Settings
+from review_converge.models import InvocationResult, Reviewer, ReviewerSpec, Usage
 from review_converge.schema import generate_schemas
 
 
@@ -110,6 +119,122 @@ class ConvergenceTest(unittest.TestCase):
 
 
 class HelpersTest(unittest.TestCase):
+    def test_progress_usage_formats_known_and_unknown_fields(self):
+        invocation = InvocationResult(
+            {},
+            Usage(input_tokens=10, output_tokens=5, cost_usd=0.25),
+            "model",
+            1.5,
+        )
+        self.assertEqual(
+            format_usage(invocation),
+            "tokens: input 10, cached unknown, output 5 — reported cost $0.250000",
+        )
+
+    def test_run_all_prints_stage_completion_and_tokens(self):
+        invocation = InvocationResult({}, Usage(output_tokens=5), "model", 1.5)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            completed, failed = run_all(
+                {"r1": lambda: invocation},
+                stage="Initial reviews",
+                labels={"r1": "claude:opus"},
+                heartbeat_seconds=1,
+            )
+        self.assertEqual(completed, {"r1": invocation})
+        self.assertFalse(failed)
+        self.assertIn("Initial reviews started: r1=claude:opus", output.getvalue())
+        self.assertIn("output 5", output.getvalue())
+
+    def test_help_documents_defaults_guidance_safety_and_exit_codes(self):
+        help_text = build_parser().format_help()
+        for expected in (
+            "claude:opus and codex:gpt-5.6-sol",
+            "cheap:",
+            "not exact cross-provider token caps",
+            "--instruction-file",
+            "cannot override these constraints",
+            "review completed but failed --fail-on",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, help_text)
+
+    def test_main_dispatches_session_subcommand(self):
+        with mock.patch(
+            "review_converge.session.session_main", return_value=7
+        ) as entry:
+            self.assertEqual(main(["session", "--resume", "/tmp/example"]), 7)
+        entry.assert_called_once_with(["--resume", "/tmp/example"])
+
+    def test_auth_preflight_prints_non_secret_login_methods(self):
+        reviewer = Reviewer("r1", ReviewerSpec.parse("claude:opus"))
+        adapter = mock.Mock(reviewer=reviewer)
+        output = io.StringIO()
+        with (
+            mock.patch(
+                "review_converge.cli.authentication_status",
+                return_value=AuthenticationStatus("claude", True, "oauth"),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            preflight_authentication({"r1": adapter}, Path("."), 10)
+        self.assertIn("claude: authenticated (oauth)", output.getvalue())
+
+    def test_auth_preflight_fails_before_review_when_logged_out(self):
+        reviewer = Reviewer("r1", ReviewerSpec.parse("codex:gpt-5.6-sol"))
+        adapter = mock.Mock(reviewer=reviewer)
+        with (
+            mock.patch(
+                "review_converge.cli.authentication_status",
+                return_value=AuthenticationStatus("codex", False, "not logged in"),
+            ),
+            self.assertRaisesRegex(ConvergeError, "codex login"),
+        ):
+            preflight_authentication({"r1": adapter}, Path("."), 10)
+
+    def test_final_report_renders_compact_plain_text(self):
+        final = {
+            "verdict": "request_changes",
+            "converged": False,
+            "remaining_disagreements": ["Severity remains disputed"],
+            "findings": [
+                {
+                    "severity": "high",
+                    "file": "src/worker.py",
+                    "line": 84,
+                    "claim": "Shutdown ignores cancellation.",
+                }
+            ],
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_final_report(final, Path("/tmp/final.md"), full=False, color=False)
+        rendered = output.getvalue()
+        self.assertIn("Final verdict: REQUEST CHANGES", rendered)
+        self.assertIn("HIGH    src/worker.py:84", rendered)
+        self.assertIn("Severity remains disputed", rendered)
+        self.assertIn("Full report: /tmp/final.md", rendered)
+        self.assertNotIn("\033[", rendered)
+
+    def test_print_report_includes_retained_markdown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "final.md"
+            path.write_text("# Full review\n\nDetails.\n", encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                print_final_report(
+                    {
+                        "verdict": "approve",
+                        "converged": True,
+                        "remaining_disagreements": [],
+                        "findings": [],
+                    },
+                    path,
+                    full=True,
+                    color=False,
+                )
+        self.assertIn("# Full review\n\nDetails.", output.getvalue())
+
     def test_artifact_paths_have_no_round_zero_special_case(self):
         root = Path("/tmp/output")
         self.assertEqual(artifact_path(root, 0, "r1"), root / "round-0-r1.json")
@@ -124,6 +249,16 @@ class HelpersTest(unittest.TestCase):
     def test_render_prompt_rejects_missing_values(self):
         with self.assertRaises(ConvergeError):
             render_prompt("review.md", {})
+
+    def test_render_prompt_preserves_placeholder_like_operator_text(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "custom.md").write_text("Guidance: {{value}}\n", encoding="utf-8")
+            with mock.patch("review_converge.cli.PROMPTS", root):
+                rendered = render_prompt(
+                    "custom.md", {"value": "Keep {{literal}} text"}
+                )
+        self.assertEqual(rendered, "Guidance: Keep {{literal}} text\n")
 
     def test_local_argument_validation(self):
         base = {
@@ -213,11 +348,18 @@ class LocalSnapshotTest(unittest.TestCase):
                         str(repo),
                         "--output-dir",
                         str(root / "out"),
+                        "--instruction",
+                        "Focus on compatibility",
                         "--dry-run",
                     ]
                 )
             self.assertEqual(result, 0)
             self.assertTrue((root / "out" / "snapshot.json").is_file())
+            manifest = json.loads((root / "out" / "run.json").read_text())
+            self.assertEqual(
+                manifest["configuration"]["instructions"],
+                ["Focus on compatibility"],
+            )
 
     def test_dirty_changes_require_opt_in(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -346,6 +488,15 @@ class PaginationTest(unittest.TestCase):
 
 
 class GitHubSnapshotTest(unittest.TestCase):
+    def git(self, repo: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+
     def test_keeps_base_tip_and_merge_base_separate_without_fetch(self):
         metadata = {
             "number": 7,
@@ -380,6 +531,34 @@ class GitHubSnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot.base_tip_sha, "new-base-tip")
         self.assertEqual(snapshot.merge_base_sha, "old-merge-base")
         self.assertEqual(snapshot.pr, 7)
+
+    def test_pins_captured_base_when_base_branch_has_advanced(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-q")
+            self.git(repo, "config", "user.name", "Test")
+            self.git(repo, "config", "user.email", "test@example.com")
+            (repo / "file.txt").write_text("base\n", encoding="utf-8")
+            self.git(repo, "add", "file.txt")
+            self.git(repo, "commit", "-qm", "captured base")
+            captured_base = self.git(repo, "rev-parse", "HEAD")
+            (repo / "file.txt").write_text("advanced\n", encoding="utf-8")
+            self.git(repo, "commit", "-qam", "advanced base")
+            fetched_base = self.git(repo, "rev-parse", "HEAD")
+            self.git(
+                repo,
+                "update-ref",
+                "refs/review-converge/base-tip-7",
+                fetched_base,
+            )
+            self.git(repo, "update-ref", "refs/review-converge/pr-7", fetched_base)
+
+            pin_fetched_base(repo, 7, captured_base, fetched_base, 10)
+            self.assertEqual(
+                self.git(repo, "rev-parse", "refs/review-converge/base-tip-7"),
+                captured_base,
+            )
 
 
 class SchemaTest(unittest.TestCase):

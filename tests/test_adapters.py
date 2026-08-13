@@ -7,9 +7,12 @@ from unittest import mock
 
 from review_converge.adapters import (
     AdapterInvocationError,
+    AuthenticationStatus,
     ClaudeAdapter,
+    CodexAdapter,
     CopilotAdapter,
     _copilot_content,
+    authentication_status,
 )
 from review_converge.core import ConvergeError
 from review_converge.models import Reviewer, ReviewerSpec
@@ -23,6 +26,38 @@ class CopilotAdapterTest(unittest.TestCase):
         response = '{"reviewer":"r1","findings":[]}'
         events = [{"type": "assistant.message", "data": {"content": response}}]
         self.assertEqual(_copilot_content(events), response)
+
+    def test_extracts_single_json_fence_from_copilot_response(self):
+        response = '{"reviewer":"r1","findings":[]}'
+        events = [
+            {
+                "type": "assistant.message",
+                "data": {"content": f"```json\n{response}\n```"},
+            }
+        ]
+        self.assertEqual(_copilot_content(events), response)
+
+    def test_extracts_one_fenced_json_object_with_surrounding_prose(self):
+        events = [
+            {
+                "type": "assistant.message",
+                "data": {"content": 'Result:\n```json\n{"ok":true}\n```'},
+            }
+        ]
+        self.assertEqual(_copilot_content(events), '{"ok":true}')
+
+    def test_rejects_multiple_fenced_json_objects_as_ambiguous(self):
+        events = [
+            {
+                "type": "assistant.message",
+                "data": {
+                    "content": '```json\n{"first":true}\n```\n'
+                    '```json\n{"second":true}\n```'
+                },
+            }
+        ]
+        with self.assertRaisesRegex(ConvergeError, "structured JSON response"):
+            _copilot_content(events)
 
     def test_permission_argv_is_read_only_and_model_is_explicit(self):
         event = (
@@ -79,6 +114,35 @@ class CopilotAdapterTest(unittest.TestCase):
             self.assertEqual(invoke.call_count, 1)
 
 
+class AuthenticationStatusTest(unittest.TestCase):
+    def test_claude_status_parses_method_without_exposing_credentials(self):
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps({"loggedIn": True, "authMethod": "oauth"}),
+            stderr="",
+        )
+        with mock.patch(
+            "review_converge.adapters.run", return_value=completed
+        ) as runner:
+            status = authentication_status("claude", Path("."), 10)
+        self.assertEqual(status, AuthenticationStatus("claude", True, "oauth"))
+        self.assertEqual(
+            runner.call_args.args[0], ["claude", "auth", "status", "--json"]
+        )
+
+    def test_codex_status_parses_login_type(self):
+        completed = subprocess.CompletedProcess(
+            [], 0, stdout="Logged in using ChatGPT\n", stderr=""
+        )
+        with mock.patch("review_converge.adapters.run", return_value=completed):
+            status = authentication_status("codex", Path("."), 10)
+        self.assertEqual(status, AuthenticationStatus("codex", True, "ChatGPT"))
+
+    def test_copilot_has_no_noninteractive_status(self):
+        self.assertIsNone(authentication_status("copilot", Path("."), 10))
+
+
 class FailedUsageTest(unittest.TestCase):
     def test_claude_failure_retains_reported_usage(self):
         envelope = {
@@ -107,3 +171,33 @@ class FailedUsageTest(unittest.TestCase):
                 adapter.invoke("prompt", schema)
         self.assertEqual(raised.exception.result.usage.cost_usd, 0.25)
         self.assertEqual(raised.exception.result.usage.output_tokens, 20)
+
+
+class CodexAdapterTest(unittest.TestCase):
+    def test_model_and_reasoning_effort_are_explicit(self):
+        event = '{"type":"turn.completed"}\n'
+
+        def fake_run(argv, **_kwargs):
+            output = Path(argv[argv.index("--output-last-message") + 1])
+            output.write_text('{"reviewer":"r2"}', encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, stdout=event, stderr="")
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            mock.patch(
+                "review_converge.adapters.command_version", return_value="codex 1"
+            ),
+            mock.patch("review_converge.adapters.run", side_effect=fake_run) as runner,
+        ):
+            schema = Path(temp) / "schema.json"
+            schema.write_text('{"type":"object"}', encoding="utf-8")
+            adapter = CodexAdapter(
+                Reviewer("r2", ReviewerSpec.parse("codex:gpt-5.6-sol")),
+                Path(temp),
+                10,
+                "low",
+            )
+            adapter.invoke("prompt", schema)
+        argv = runner.call_args.args[0]
+        self.assertIn("gpt-5.6-sol", argv)
+        self.assertIn('model_reasoning_effort="low"', argv)

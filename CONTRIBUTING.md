@@ -21,6 +21,10 @@ python3 -m review_converge --help
 - Do not silently omit unavailable context or unsupported input.
 - Treat configuration and context from the reviewed repository as untrusted. Never add implicit configuration discovery.
 - Update the README and example output when the user-visible contract changes.
+- Keep session capabilities ordered and explicit: `review` < `propose` < `edit`.
+- Never add implicit patch application, arbitrary shell execution, or publication
+  to the session REPL. Mutable actions require a durable proposal and explicit
+  operator confirmation.
 
 Tests should not require GitHub access or invoke an AI provider. Use mocks or temporary local Git repositories.
 

@@ -14,6 +14,57 @@ A second model is useful only when it independently checks the evidence. This to
 
 All inputs, model outputs, and the final report are retained as an auditable snapshot. See [an example final report](examples/final.md).
 
+## Maintainer workbench sessions
+
+The optional session REPL extends the same auditable, evidence-first model to
+explanation, challenge, patch proposal, patch application, and independent
+re-review. It does not enable shell execution, builds, tests, commits, pushes,
+GitHub posts, or other publication operations.
+
+Start a durable session with its artifacts outside the reviewed checkout:
+
+```sh
+review-converge session \
+  --new /tmp/my-change-session \
+  --repo-dir . \
+  --base main
+```
+
+The initial `review` capability is read-only. Escalate deliberately when a task
+needs a patch proposal or checkout mutation:
+
+```text
+rc> explain how shutdown ownership works
+rc> challenge the claim that this callback is serialized
+rc> mode propose
+rc> propose fix the accepted lifecycle finding with a minimal patch
+rc> diff proposal-001
+rc> mode edit
+rc> apply proposal-001 --yes
+rc> checkpoint
+rc> review
+rc> export markdown
+```
+
+Commands may optionally begin with `/`. Resume later with:
+
+```sh
+review-converge session --resume /tmp/my-change-session
+```
+
+Every command and capability change is appended to `events.jsonl`. Agent
+responses, immutable patch proposals, checkpoints, nested review runs, generated
+schemas, and `summary.md` are retained beneath the session directory. Applying a
+proposal requires `edit` mode, explicit `--yes`, an unchanged SHA-256-verified
+patch, and a successful `git apply --check`.
+
+Use `--command` for scripting or inspecting a session without an interactive
+terminal:
+
+```sh
+review-converge session --resume /tmp/my-change-session --command status
+```
+
 ## Requirements
 
 - Python 3.10+
@@ -22,6 +73,8 @@ All inputs, model outputs, and the final report are retained as an auditable sna
 - authenticated `gh` CLI for GitHub PR mode only
 
 The default Claude/Codex installation has no unconditional third-party runtime dependencies. Python 3.10 installs the `tomli` compatibility package. Copilot support uses the optional `jsonschema` validator.
+
+Before paid review calls, the tool runs the non-billable authentication status commands provided by Claude and Codex and prints only the login method, never credentials or tokens. Copilot has no equivalent non-interactive status command, so its authentication is checked by its first invocation.
 
 ## Installation
 
@@ -101,7 +154,7 @@ review-converge --local --base main --dry-run
 
 ## Reviewers and configuration
 
-The default pair remains Claude plus Codex. Configure exactly two slots by repeating `--reviewer`; model selection is explicit when provided:
+The built-in pair is `claude:opus` (currently Opus 5) and `codex:gpt-5.6-sol` with low reasoning effort; the latter is also the default final decider. Override exactly two slots by repeating `--reviewer`, and use `--codex-reasoning-effort` to change Codex effort:
 
 ```sh
 review-converge --local --base main \
@@ -120,6 +173,24 @@ review-converge --config review-converge.toml --local --base main
 
 See [examples/review-converge.toml](examples/review-converge.toml). Configuration is never discovered automatically from the reviewed repository because pull-request content is untrusted. Command-line values override the selected file.
 
+## Review cost profiles
+
+Use a named profile when you want a simple effort/cost choice:
+
+```sh
+review-converge --local --base main --review-profile cheap
+review-converge --pr 1234 --review-profile balanced
+review-converge --pr 1234 --review-profile thorough
+```
+
+| Profile | Reviewers | Codex effort | Reconciliation | Maximum calls |
+| --- | --- | --- | ---: | ---: |
+| `cheap` | Claude Sonnet + Codex | low | 0 rounds | 3 |
+| `balanced` | Claude Sonnet + Codex | low | 1 round | 5 |
+| `thorough` | Claude Opus + Codex | medium | 3 rounds | 9 |
+
+The maximum is two initial reviews, two calls per reconciliation round, and one final decision. Reconciliation may stop early. Profiles are relative effort controls, not exact cross-provider token ceilings: the CLIs do not expose one portable token-limit mechanism. Explicit command-line flags override profile values. For tighter provider-specific control, use `--rounds`, `--codex-reasoning-effort`, `--claude-max-budget-usd`, and `--copilot-max-ai-credits`. Actual reported usage is printed during the run and retained in `usage.json`.
+
 ## Project context
 
 Give both reviewers immutable copies of project-specific guidance:
@@ -132,6 +203,18 @@ review-converge --local --base main \
 
 Context paths must be files inside the checkout. Their copies and SHA-256 hashes are recorded, and a changed source or captured copy makes resume fail closed.
 
+## Custom review guidance
+
+Add trusted operator guidance inline or from a file:
+
+```sh
+review-converge --pr 1234 \
+  --instruction "Review as a maintainer; prioritize compatibility and shutdown behavior" \
+  --instruction-file /path/to/team-review-guidance.md
+```
+
+Both options are repeatable. Instructions are retained in `run.json`, included in resume compatibility checks, and applied to the independent reviews, reconciliation, and final decision. They may specialize the review but cannot enable checkout edits, builds, tests, network access, or GitHub writes. Only use `--instruction-file` with content you trust; repository source and `--context-file` content remain untrusted reference material rather than instructions.
+
 ## Convergence and final decision
 
 Initial reviews run concurrently. In each reconciliation round, both reviewers accept, reject, downgrade, or mark every namespaced finding as already covered. Early convergence requires:
@@ -142,7 +225,7 @@ Initial reviews run concurrently. In each reconciliation round, both reviewers a
 - no new findings; and
 - no material disagreements.
 
-After the configured maximum, the final decider resolves what it can from evidence and records anything unresolved. Three rounds is the default; `--rounds 0` skips reconciliation. Codex is the default final decider; any supported `provider[:model]` can be selected.
+After the configured maximum, the final decider resolves what it can from evidence and records anything unresolved. Three rounds is the default; `--rounds 0` skips reconciliation. `codex:gpt-5.6-sol` is the default final decider; any supported `provider[:model]` can be selected.
 
 ## Resume interrupted runs
 
@@ -174,6 +257,10 @@ Outputs are written under the system temporary directory by default. Each run co
 - `round-0-*.json` independent reviews;
 - one pair of JSON artifacts per reconciliation round; and
 - `final.json` plus the maintainer-readable `final.md`.
+
+Long-running stages print their active reviewer slots, a heartbeat every 30 seconds, completion duration, and provider-reported token/cost fields. Unknown fields remain `unknown`. Use `--verbose` for 10-second heartbeats and details about artifacts reused during resume. Prompts and raw provider output are not streamed to the terminal.
+
+After completion, the CLI prints a compact verdict, convergence state, and finding list. Use `--print-report` to also print the complete retained `final.md`; this works with a completed `--resume` directory without invoking a model. Interactive terminals receive minimal verdict/severity color unless `NO_COLOR` is set, while redirected and CI output remains plain text.
 
 ## Safety and cost
 

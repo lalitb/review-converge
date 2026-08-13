@@ -149,7 +149,7 @@ Verification: Python 3.10-3.13 tests, wheel build/install, local and GitHub dry 
 
 ## Acceptance criteria
 
-- Default invocation remains simple and uses Claude plus Codex.
+- Default invocation remains simple and uses `claude:opus` (currently Opus 5) plus `codex:gpt-5.6-sol` at low reasoning effort, with the Codex model as final decider.
 - Exactly two active reviewers are enforced everywhere.
 - Copilot cannot select `auto` and cannot receive write, URL, memory, or GitHub MCP tools.
 - Every final claim can be traced to immutable source, context, provider, model, prompt, schema, and usage artifacts.

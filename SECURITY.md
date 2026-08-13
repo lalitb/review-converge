@@ -17,10 +17,20 @@ Local mode (`--local`) makes no GitHub API calls and performs no network fetch. 
 
 Configuration is loaded only from an explicit `--config` path. The tool never auto-loads configuration from the reviewed checkout. Context files must resolve inside that checkout and are copied and hashed before model invocation.
 
+`--instruction` and `--instruction-file` are trusted operator inputs. They may narrow review scope or add criteria, but prompts explicitly prevent them from overriding source-only and no-write constraints. Do not point `--instruction-file` at untrusted pull-request content; use `--context-file` for untrusted repository documentation.
+
 Copilot does not currently expose the same operating-system sandbox boundary as Codex. Its safety boundary is an availability filter that exposes only read, glob, and search, plus explicit denials for shell and edit tools. Because shell is unavailable, Copilot reviews the captured patch and readable checkout files but cannot use `git show` to inspect a pinned object that differs from the worktree. Verify the installed Copilot CLI version and organization policy recorded in `run.json`; use Codex when an OS-enforced read-only sandbox or pinned-object inspection is required.
 
 `--resume` verifies immutable inputs and completed artifact hashes before continuing. It fails closed if source, context, prompts, schemas, configuration, provider CLI versions, or recorded artifacts have changed.
 
 These controls reduce risk but do not make arbitrary repository content trusted. Run the tool only in repositories you are willing to expose to both configured model providers. Review CLI configuration, hooks, plugins, MCP servers, and organization policies before use. Never place API keys in the repository or command arguments.
+
+Maintainer workbench sessions start in read-only `review` mode. `propose` mode
+allows an agent to create a unified-diff artifact but does not modify the
+checkout. `edit` mode permits only application of a previously recorded patch;
+the operator must name the proposal and pass `--yes`. Before application, the
+tool verifies the recorded SHA-256 digest and runs `git apply --check`. Sessions
+must be stored outside the reviewed checkout and never expose arbitrary shell,
+build, test, commit, push, or GitHub-write commands.
 
 Report vulnerabilities privately to the repository maintainers rather than opening a public issue with exploit details.

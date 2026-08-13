@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from review_converge.adapters import AuthenticationStatus
 from review_converge.cli import main
 from review_converge.models import InvocationResult, Usage
 
@@ -52,6 +53,16 @@ class FakeAdapter:
 
 
 class WorkflowTest(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch(
+            "review_converge.cli.authentication_status",
+            side_effect=lambda provider, *_args: AuthenticationStatus(
+                provider, True, "test"
+            ),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def git(self, repo, *args):
         return subprocess.run(
             ["git", *args],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -17,6 +18,56 @@ class ReviewerAdapter(Protocol):
     cli_version: str
 
     def invoke(self, prompt: str, schema_path: Path) -> InvocationResult: ...
+
+
+@dataclass(frozen=True)
+class AuthenticationStatus:
+    provider: str
+    authenticated: bool
+    detail: str
+
+
+def authentication_status(
+    provider: str, repo_dir: Path, timeout: int
+) -> AuthenticationStatus | None:
+    """Return a non-billable CLI authentication status when supported."""
+    if provider == "claude":
+        result = run(
+            ["claude", "auth", "status", "--json"],
+            cwd=repo_dir,
+            timeout=timeout,
+            check=False,
+        )
+        try:
+            value = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ConvergeError(
+                "Claude authentication status returned invalid JSON"
+            ) from exc
+        if not isinstance(value, dict) or not isinstance(value.get("loggedIn"), bool):
+            raise ConvergeError("Claude authentication status was incomplete")
+        method = value.get("authMethod")
+        detail = (
+            method if isinstance(method, str) and method != "none" else "not logged in"
+        )
+        return AuthenticationStatus("claude", value["loggedIn"], detail)
+    if provider == "codex":
+        result = run(
+            ["codex", "login", "status"],
+            cwd=repo_dir,
+            timeout=timeout,
+            check=False,
+        )
+        text = (result.stdout.strip() or result.stderr.strip()).splitlines()
+        detail = text[-1] if text else "status unavailable"
+        if result.returncode:
+            detail = "not logged in"
+        elif detail.lower().startswith("logged in using "):
+            detail = detail[len("Logged in using ") :]
+        return AuthenticationStatus("codex", result.returncode == 0, detail)
+    if provider == "copilot":
+        return None
+    raise ConvergeError(f"Unsupported authentication provider: {provider}")
 
 
 class AdapterInvocationError(ConvergeError):
@@ -206,6 +257,7 @@ class CodexAdapter:
     reviewer: Reviewer
     repo_dir: Path
     timeout: int
+    reasoning_effort: str = "low"
 
     def __post_init__(self) -> None:
         self.cli_version = command_version("codex", self.repo_dir, self.timeout)
@@ -234,6 +286,9 @@ class CodexAdapter:
             ]
             if self.reviewer.spec.model:
                 argv.extend(["--model", self.reviewer.spec.model])
+            argv.extend(
+                ["--config", f'model_reasoning_effort="{self.reasoning_effort}"']
+            )
             argv.append(prompt)
             started = time.monotonic()
             result = run(argv, cwd=self.repo_dir, timeout=self.timeout, check=False)
@@ -308,11 +363,26 @@ def _copilot_content(events: list[dict[str, Any]]) -> str:
 
     visit(events)
     for candidate in reversed(candidates):
+        stripped = candidate.strip()
         try:
-            if isinstance(json.loads(candidate.strip()), dict):
-                return candidate
+            if isinstance(json.loads(stripped), dict):
+                return stripped
         except json.JSONDecodeError:
-            continue
+            matches = re.finditer(
+                r"```(?:json)?[ \t]*\r?\n(?P<body>.*?)\r?\n```",
+                stripped,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            valid: list[str] = []
+            for match in matches:
+                fenced = match.group("body").strip()
+                try:
+                    if isinstance(json.loads(fenced), dict):
+                        valid.append(fenced)
+                except json.JSONDecodeError:
+                    continue
+            if len(valid) == 1:
+                return valid[0]
     raise ConvergeError(
         "Copilot JSONL output did not contain a structured JSON response"
     )
@@ -453,12 +523,13 @@ def make_adapter(
     accessible_dirs: tuple[Path, ...] = (),
     claude_max_budget_usd: float | None = None,
     copilot_max_ai_credits: float | None = None,
+    codex_reasoning_effort: str = "low",
     structured_retries: int = 1,
 ) -> ReviewerAdapter:
     if reviewer.spec.provider == "claude":
         return ClaudeAdapter(reviewer, repo_dir, timeout, claude_max_budget_usd)
     if reviewer.spec.provider == "codex":
-        return CodexAdapter(reviewer, repo_dir, timeout)
+        return CodexAdapter(reviewer, repo_dir, timeout, codex_reasoning_effort)
     return CopilotAdapter(
         reviewer,
         repo_dir,
